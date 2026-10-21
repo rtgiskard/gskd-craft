@@ -33,10 +33,19 @@ describe("recovery policy consumer behavior", () => {
 	for (const [text, status] of [
 		["invalid_api_key", 401], ["permission denied", 403], ["model_not_found", 404],
 		["invalid_request_error", 400], ["insufficient_quota", 429],
+		["已达到 5 小时的使用上限", 429], ["monthly spend limit", 429],
+		["You exceeded your current quota, please check your plan and billing details.", 429],
 		["billing credit balance exhausted", 429], ["certificate verify failed", undefined],
 		["failed to parse tool call arguments", undefined],
 	] as const) test(`does not turn hard failures into model traffic: ${text}`, () => {
 		expect(classifyFailure(failure(text, status))).toBeUndefined();
+	});
+
+	for (const text of [
+		"Online prediction concurrent requests quota exceeded",
+		"You exceeded your current quota, please check your plan and billing details. https://help.aliyun.com/error-code#token-limit",
+	]) test(`recovers quota-worded temporary throttles: ${text}`, () => {
+		expect(classifyFailure(failure(text, 429))?.kind).toBe("transient");
 	});
 
 	test("successful and deliberately aborted turns never arm recovery", () => {

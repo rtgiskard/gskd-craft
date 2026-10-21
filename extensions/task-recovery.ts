@@ -9,16 +9,20 @@ const MAX_PROBES = 2;
 const MAX_TIMER_MS = 2_147_483_647;
 
 type AgentMessage = AgentEndEvent["messages"][number];
-type Phase = "cooldown" | "submitted" | "running";
 interface Recovery {
 	generation: number;
 	sessionId: string;
-	leafId: string | null;
-	failureKey: string;
-	failure: RecoveryFailure;
-	phase: Phase;
-	deadline: number;
 	startedAt: number;
+	failureKey: string;
+	running: boolean;
+	submittedAttempt?: number;
+	settleSignal?: AbortSignal;
+}
+interface Schedule {
+	leafId: string | null;
+	failure: RecoveryFailure;
+	phase: "cooldown" | "submitted";
+	deadline: number;
 	timer?: Timer;
 	detachAbort?: () => void;
 }
@@ -56,6 +60,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	let attempts = 0;
 	let probes = 0;
 	let recovery: Recovery | undefined;
+	let schedule: Schedule | undefined;
 	let diagnostic = "idle";
 	let unsubscribeInput: (() => void) | undefined;
 	let terminalFailureKey: string | undefined;
@@ -75,11 +80,11 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 
 	function render(ctx: ExtensionContext): void {
 		if (ctx.agent.kind !== "main" || ctx.mode !== "tui" || !ctx.hasUI) return;
-		if (!active(ctx) || recovery?.phase !== "cooldown") {
+		if (!active(ctx) || schedule?.phase !== "cooldown") {
 			ctx.ui.setWidget(STATUS_KEY, undefined);
 			return;
 		}
-		const seconds = Math.max(0, Math.ceil((recovery.deadline - Date.now()) / 1000));
+		const seconds = Math.max(0, Math.ceil((schedule.deadline - Date.now()) / 1000));
 		const detail = ` · retry #${attempts} after ${seconds}s · Esc to cancel`;
 		ctx.ui.setWidget(STATUS_KEY, (_tui, theme) => ({
 			render(width) {
@@ -89,18 +94,19 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		}), { placement: "aboveEditor" });
 	}
 
-	function release(ctx: ExtensionContext): void {
-		if (!recovery) return;
-		if (recovery.timer !== undefined) ctx.clearTimer(recovery.timer);
-		recovery.detachAbort?.();
-		recovery = undefined;
+	function releaseSchedule(ctx: ExtensionContext): void {
+		if (!schedule) return;
+		if (schedule.timer !== undefined) ctx.clearTimer(schedule.timer);
+		schedule.detachAbort?.();
+		schedule = undefined;
 	}
 
 	function invalidate(ctx: ExtensionContext, reason: string): void {
 		generation++;
 		// A detached agent_end for this same failure cannot resurrect cancelled work.
 		terminalFailureKey = recovery?.failureKey ?? terminalFailureKey;
-		release(ctx);
+		releaseSchedule(ctx);
+		recovery = undefined;
 		attempts = 0;
 		probes = 0;
 		diagnostic = reason;
@@ -108,7 +114,8 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	}
 
 	function pause(ctx: ExtensionContext, reason: string): void {
-		release(ctx);
+		// Host work replaces our scheduling, not the recovery episode it continues.
+		releaseSchedule(ctx);
 		diagnostic = reason;
 		render(ctx);
 	}
@@ -124,26 +131,27 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 			ctx.sessionManager.getSessionId() === plan.sessionId;
 	}
 
-	function arm(ctx: ExtensionContext, plan: Recovery, delay: number): void {
+	function arm(ctx: ExtensionContext, episode: Recovery, plan: Schedule, delay: number): void {
 		plan.timer = ctx.setTimeout(() => {
 			plan.timer = undefined;
-			if (!current(ctx, plan)) return;
+			if (!current(ctx, episode) || schedule !== plan) return;
 			if (ctx.sessionManager.getLeafId() !== plan.leafId || ctx.hasPendingMessages()) {
 				invalidate(ctx, "superseded by conversation activity");
 				return;
 			}
 			const remaining = plan.deadline - Date.now();
 			if (remaining > 0) {
-				arm(ctx, plan, remaining);
+				arm(ctx, episode, plan, remaining);
 				return;
 			}
 			const jobs = ctx.getAsyncJobSnapshot();
 			if (!ctx.isIdle() || (jobs && (jobs.running.length > 0 || jobs.delivery.queued > 0 || jobs.delivery.delivering || jobs.delivery.pendingJobIds.length > 0))) {
 				// Core owns active retry/compaction/background delivery; never queue behind it.
-				arm(ctx, plan, 1_000);
+				arm(ctx, episode, plan, 1_000);
 				return;
 			}
 			plan.phase = "submitted"; // Claim before the void API can synchronously re-enter.
+			episode.submittedAttempt = attempts;
 			plan.detachAbort?.();
 			plan.detachAbort = undefined;
 			render(ctx);
@@ -153,23 +161,26 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 					content: RECOVERY_PROMPT,
 					display: false,
 					attribution: "agent",
-					details: { generation: plan.generation, attempt: attempts },
+					details: { generation: episode.generation, attempt: attempts },
 				}, { triggerTurn: true, deliverAs: "nextTurn" });
 			} catch (error) {
-				pause(ctx, "host rejected recovery submission");
+				invalidate(ctx, "host rejected recovery submission");
 				notify(ctx, `Recovery submission failed: ${String(error)}`, "warning");
 			}
 		}, Math.min(MAX_TIMER_MS, Math.max(1, delay)));
 	}
 
-	function consider(ctx: ExtensionContext, message: AssistantMessage | undefined, messages: AgentMessage[], signal?: AbortSignal): void {
-		if (!active(ctx) || !message || signal?.aborted) return;
+	function consider(ctx: ExtensionContext, message: AssistantMessage | undefined, messages: AgentMessage[], signal?: AbortSignal, settled = false): void {
+		if (signal?.aborted || (settled && recovery?.settleSignal?.aborted)) { invalidate(ctx, "cancelled"); return; }
+		if (!active(ctx) || !message) return;
 		const key = failureKey(message);
 		if (recovery?.failureKey === key || terminalFailureKey === key) return;
 		const failure = classifyFailure(message);
 		if (!failure) {
-			// A submitted retry is not a success; only its settled, normal completion counts.
-			if (recovery?.phase === "running" && message.stopReason === "stop" && unpairedCalls(messages).length === 0) {
+			// session_stop precedes other hooks' continuation decisions. Only the
+			// terminal agent_end can finish an episode, never a submission receipt.
+			if (!settled) return;
+			if (recovery?.running && !schedule && recovery.submittedAttempt === undefined && current(ctx, recovery) && message.stopReason === "stop" && unpairedCalls(messages).length === 0) {
 				const now = Date.now();
 				const elapsedMs = Math.max(0, now - recovery.startedAt);
 				statistics.completed++;
@@ -182,37 +193,44 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 			terminalFailureKey = key;
 			return;
 		}
-		const startedAt = recovery?.startedAt ?? Date.now();
-		release(ctx);
+		releaseSchedule(ctx);
 		terminalFailureKey = key;
 		const missing = unpairedCalls(messages);
 		if (missing.length > 0) {
-			diagnostic = `paused: ${missing.length} tool outcome(s) unpaired`;
-			render(ctx);
+			invalidate(ctx, `paused: ${missing.length} tool outcome(s) unpaired`);
+			terminalFailureKey = key;
 			notify(ctx, `Automatic recovery paused: no recorded result for tool call(s) ${missing.join(", ")}. OMP exposes no public repair/verification API for these unknown outcomes; inspect actual state before continuing. No tool results were fabricated.`, "warning");
 			return;
 		}
 		if (failure.kind === "suspected" && probes >= MAX_PROBES) {
-			diagnostic = "paused: unconfirmed communication failure probe limit";
-			render(ctx);
+			invalidate(ctx, "paused: unconfirmed communication failure probe limit");
+			terminalFailureKey = key;
 			notify(ctx, "Automatic recovery paused after two unconfirmed transport-failure probes; inspect the error before continuing.", "warning");
 			return;
 		}
 		if (failure.kind === "suspected") probes++;
 		attempts++;
-		const plan: Recovery = {
-			generation, sessionId: ctx.sessionManager.getSessionId(), leafId: ctx.sessionManager.getLeafId(),
-			failureKey: key, failure, phase: "cooldown", deadline: Date.now() + recoveryDelay(attempts, failure.retryAfterMs),
-			startedAt,
+		const episode = recovery ?? {
+			generation, sessionId: ctx.sessionManager.getSessionId(), startedAt: Date.now(), failureKey: key, running: false,
+			settleSignal: signal,
 		};
-		recovery = plan;
+		episode.failureKey = key;
+		// A new failure supersedes the prior submission, including a receipt
+		// whose message_start handler has not reached this extension yet.
+		episode.submittedAttempt = undefined;
+		const plan: Schedule = {
+			leafId: ctx.sessionManager.getLeafId(), failure, phase: "cooldown",
+			deadline: Date.now() + recoveryDelay(attempts, failure.retryAfterMs),
+		};
+		recovery = episode;
+		schedule = plan;
 		if (signal) {
-			const cancel = () => { if (current(ctx, plan)) invalidate(ctx, "cancelled"); };
+			const cancel = () => { if (current(ctx, episode) && schedule === plan) invalidate(ctx, "cancelled"); };
 			signal.addEventListener("abort", cancel, { once: true });
 			plan.detachAbort = () => signal.removeEventListener("abort", cancel);
 		}
 		render(ctx);
-		arm(ctx, plan, plan.deadline - Date.now());
+		arm(ctx, episode, plan, plan.deadline - Date.now());
 	}
 
 	function bind(ctx: ExtensionContext): void {
@@ -246,22 +264,26 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	});
 	pi.on("before_agent_start", (event, ctx) => {
 		// OMP 18.12 custom-only turns bypass this hook. Also protect hosts that emit it.
-		if (recovery?.phase === "submitted" && event.prompt === RECOVERY_PROMPT) return;
+		if (recovery?.submittedAttempt !== undefined && event.prompt === RECOVERY_PROMPT) return;
 		invalidate(ctx, "new user turn");
 	});
 	pi.on("message_start", (event, ctx) => {
 		const message = event.message;
 		if (message.role === "user") invalidate(ctx, "superseded by user message");
-		else if (message.role === "custom" && message.customType === STATUS_KEY && recovery?.phase === "submitted") {
+		else if (message.role === "custom" && message.customType === STATUS_KEY && recovery?.submittedAttempt !== undefined) {
 			const details = message.details as { generation?: number; attempt?: number } | undefined;
-			if (details?.generation === generation && details.attempt === attempts) {
-				recovery.phase = "running";
+			if (details?.generation === recovery.generation && details.attempt === recovery.submittedAttempt && current(ctx, recovery)) {
+				recovery.running = true;
+				recovery.submittedAttempt = undefined;
+				releaseSchedule(ctx);
+				diagnostic = "running";
 				render(ctx);
 			}
 		}
 	});
 	pi.on("session_stop", (event, ctx) => {
 		const message = event.last_assistant_message;
+		if (recovery) recovery.settleSignal = event.signal;
 		consider(ctx, message?.role === "assistant" ? message : lastAssistant(event.messages), event.messages, event.signal);
 	});
 	pi.on("agent_end", (event, ctx) => {
@@ -270,11 +292,18 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 			return;
 		}
 		// session_stop is deliberately skipped by core for terminal tool-call turns.
-		consider(ctx, lastAssistant(event.messages), event.messages);
+		consider(ctx, lastAssistant(event.messages), event.messages, undefined, true);
 	});
 	pi.on("auto_retry_start", (_event, ctx) => pause(ctx, "host retry in progress"));
 	pi.on("auto_compaction_start", (_event, ctx) => pause(ctx, "host compaction in progress"));
-	// auto_retry_end.success=false also means cancellation; it must never schedule recovery.
+	// Exhaustion is followed by session_stop/terminal agent_end; do not schedule
+	// from retry-end itself. Cancellation can leave an older normal assistant tail.
+	pi.on("auto_retry_end", (event, ctx) => {
+		if (!event.success && event.finalError === "Retry cancelled") invalidate(ctx, "cancelled");
+	});
+	pi.on("auto_compaction_end", (event, ctx) => {
+		if (event.aborted) invalidate(ctx, "cancelled");
+	});
 	for (const event of ["session_before_switch", "session_before_branch", "session_before_tree"] as const) {
 		pi.on(event, (_event, ctx) => invalidate(ctx, "session context changing"));
 	}
@@ -294,7 +323,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 			reportPending(ctx);
 			const action = args.trim() || "status";
 			if (action === "off") {
-				const ownTurnRunning = recovery?.phase === "running";
+				const ownTurnRunning = recovery?.running && !schedule;
 				enabled = false;
 				invalidate(ctx, "disabled");
 				if (ownTurnRunning) ctx.abort();
@@ -306,7 +335,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 				return;
 			}
 			render(ctx);
-			const state = recovery ? `${recovery.phase}; attempt=${attempts}; probes=${probes}/${MAX_PROBES}; reason=${recovery.failure.reason}; retryAt=${new Date(recovery.deadline).toISOString()}` : diagnostic;
+			const state = schedule ? `${schedule.phase}; attempt=${attempts}; probes=${probes}/${MAX_PROBES}; reason=${schedule.failure.reason}; retryAt=${new Date(schedule.deadline).toISOString()}` : diagnostic;
 			const summary = `Completed recoveries: ${statistics.completed}; total recovery time: ${Math.ceil(statistics.elapsedMs / 1000)}s; last completed: ${statistics.completed ? new Date(statistics.lastCompletedAt).toISOString() : "never"}.`;
 			notify(ctx, summary);
 			notify(ctx, `gskd-recovery: ${active(ctx) ? "on" : "off"}; ${state}. Main sessions only. Cooldown: 30/60/120/300s + jitter, respecting available retry hints. Existing receipts retained. Cancellation uses settle AbortSignal and TUI Esc/Ctrl-C; raw non-TUI aborts without a settle signal and already dispatched void submissions cannot be retracted by the public API.`);

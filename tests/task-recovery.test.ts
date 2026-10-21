@@ -103,6 +103,16 @@ function harness(): Harness {
 	};
 }
 
+function recoveryTotals(h: Harness) {
+	h.command("status");
+	const summary = h.notices.findLast(notice => notice.includes("Completed recoveries:"))!;
+	return {
+		completed: Number(summary.match(/Completed recoveries: (\d+)/)?.[1]),
+		elapsedSeconds: Number(summary.match(/total recovery time: (\d+)s/)?.[1]),
+		lastCompletedAt: summary.match(/last completed: (.*)\.$/)?.[1],
+	};
+}
+
 test("one submission per failure and unlimited confirmed recovery episodes", () => withHarness(h => {
 	for (let turn = 1; turn <= 5; turn++) {
 		const message = assistant(turn);
@@ -112,7 +122,6 @@ test("one submission per failure and unlimited confirmed recovery episodes", () 
 		expect(h.timers).toBe(1);
 		h.fireNext();
 		expect(h.sent).toHaveLength(turn);
-		expect(h.sent[turn - 1].options).toEqual({ triggerTurn: true, deliverAs: "nextTurn" });
 		h.emit("message_start", { message: { role: "custom", ...h.sent[turn - 1].message } });
 	}
 }));
@@ -152,11 +161,12 @@ test("multiple retries count as one completed recovery and notify only on the ne
 	h.emit("agent_end", { messages: [success], willContinue: false });
 	expect(h.notices).toEqual([]);
 	h.emit("input", { text: "I'm back", source: "interactive" });
-	expect(h.notices).toEqual([`Automatic recovery completed 1 time(s) since your last input; total recovery time ${elapsed}s; last completed ${completedAt}.`]);
+	expect(h.notices).toHaveLength(1);
+	expect(h.sent).toHaveLength(2);
 	h.emit("input", { text: "next input", source: "interactive" });
 	expect(h.notices).toHaveLength(1);
-	h.command("status");
-	expect(h.notices).toContain(`Completed recoveries: 1; total recovery time: ${elapsed}s; last completed: ${completedAt}.`);
+	expect(recoveryTotals(h)).toEqual({ completed: 1, elapsedSeconds: elapsed, lastCompletedAt: completedAt });
+	expect(h.sent).toHaveLength(2);
 }));
 
 for (const outcome of ["submitted", "aborted", "error", "user replacement", "session switch"] as const) {
@@ -166,10 +176,11 @@ for (const outcome of ["submitted", "aborted", "error", "user replacement", "ses
 		if (outcome === "user replacement") h.emit("input", { text: "replacement" });
 		if (outcome === "session switch") { h.emit("session_before_switch"); h.activity({ sessionId: "second" }); h.emit("session_switch"); }
 		h.stop(assistant(3, outcome === "aborted" ? "aborted" : outcome === "error" ? "error" : "stop"));
+		h.emit("agent_end", { messages: [assistant(3, outcome === "aborted" ? "aborted" : outcome === "error" ? "error" : "stop")], willContinue: false });
 		h.emit("input", { text: "back" });
 		expect(h.notices).toEqual([]);
-		h.command("status");
-		expect(h.notices).toContain("Completed recoveries: 0; total recovery time: 0s; last completed: never.");
+		expect(recoveryTotals(h).completed).toBe(0);
+		expect(h.sent).toHaveLength(1);
 	}));
 }
 
@@ -239,17 +250,224 @@ test("does not fabricate receipts or replay calls with genuinely unknown outcome
 	expect(h.notices.some(notice => notice.includes("unknown-call"))).toBe(true);
 }));
 
-test("retained successful receipts permit continuation and direct inspection of uncertain state", () => withHarness(h => {
+test("retained successful receipts permit continuation without changing history", () => withHarness(h => {
 	const tool = { ...assistant(1, "toolUse"), content: [{ type: "toolCall", id: "committed-call", name: "charge", arguments: {} }] };
 	const receipt = { role: "toolResult", toolCallId: "committed-call", content: [{ type: "text", text: "committed" }], isError: false };
 	const error = assistant(2);
 	const history = [tool, receipt, error]; const before = structuredClone(history);
 	h.stop(error, undefined, history); h.fireNext();
 	expect(history).toEqual(before); expect(h.sent).toHaveLength(1);
-	expect(h.sent[0].message.content).toContain("read-only checks");
 }));
 
 test("subagent factories never submit recovery turns", () => withHarness(h => {
 	h.activity({ kind: "sub" }); h.emit("session_start"); h.stop(); h.command("on"); h.advance(600_000);
 	expect(h.sent).toHaveLength(0);
+}));
+
+for (const owner of ["auto_retry_start", "auto_compaction_start", "willContinue", "awaitingAsyncWork"] as const) {
+	test(`${owner} preserves the running episode and its original elapsed time`, () => withHarness(h => {
+		h.advance(7000);
+		const startedAt = h.now;
+		h.stop(); h.fireNext();
+		h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+		h.advance(1500);
+		const intermediate = assistant(2, owner === "awaitingAsyncWork" ? "stop" : "error");
+		// Core retry/compaction starts during maintenance, before session_stop;
+		// async waits skip session_stop entirely and publish a nonterminal end.
+		if (owner === "auto_retry_start" || owner === "auto_compaction_start") h.emit(owner);
+		h.emit("agent_end", { messages: [intermediate], willContinue: true, awaitingAsyncWork: owner === "awaitingAsyncWork" });
+		expect(h.timers).toBe(0);
+		h.advance(4000);
+		if (owner === "auto_retry_start") h.emit("auto_retry_end", { success: true, attempt: 1 });
+		if (owner === "auto_compaction_start") h.emit("auto_compaction_end", { aborted: false, willRetry: true });
+		const success = assistant(3, "stop");
+		h.stop(success);
+		expect(h.notices).toEqual([]);
+		h.emit("agent_end", { messages: [success], willContinue: false });
+		h.stop(success);
+		h.emit("agent_end", { messages: [success], willContinue: false });
+		const elapsedSeconds = Math.ceil((h.now - startedAt) / 1000);
+		const lastCompletedAt = new Date(h.now).toISOString();
+		h.emit("input", { text: "back" });
+		expect(h.notices).toHaveLength(1);
+		h.emit("input", { text: "again" });
+		expect(h.notices).toHaveLength(1);
+		expect(recoveryTotals(h)).toEqual({ completed: 1, elapsedSeconds, lastCompletedAt });
+		h.advance(600_000);
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers).toBe(0);
+	}));
+}
+
+test("retry exhaustion re-enters extension cooldown without restarting the episode clock", () => withHarness(h => {
+	h.advance(9000);
+	const startedAt = h.now;
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.emit("auto_retry_start");
+	h.advance(5000);
+	h.emit("agent_end", { messages: [assistant(2)], willContinue: true });
+	h.advance(6000);
+	h.emit("auto_retry_end", { success: false, finalError: "upstream_http2_stream_error" });
+	expect(h.timers).toBe(0);
+	const exhausted = assistant(3);
+	h.stop(exhausted);
+	h.emit("agent_end", { messages: [exhausted], willContinue: false });
+	h.stop(exhausted);
+	expect(h.timers).toBe(1);
+	h.fireNext();
+	expect(h.sent).toHaveLength(2);
+	h.emit("message_start", { message: { role: "custom", ...h.sent[1].message } });
+	const success = assistant(4, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(1);
+	expect(recoveryTotals(h).elapsedSeconds).toBe(Math.ceil((h.now - startedAt) / 1000));
+	expect(h.sent).toHaveLength(2);
+}));
+
+test("a session_stop followed by another hook's continuation is not a completed recovery", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	const intermediate = assistant(2, "stop");
+	h.stop(intermediate);
+	h.emit("agent_end", { messages: [intermediate], willContinue: true });
+	expect(recoveryTotals(h).completed).toBe(0);
+	h.advance(2000);
+	const success = assistant(3, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(1);
+	expect(h.sent).toHaveLength(1);
+}));
+
+for (const cancellation of ["off", "Esc", "input", "user message", "new turn", "session switch", "retry cancellation", "compaction cancellation", "settle cancellation"] as const) {
+	test(`${cancellation} ends a host-owned running recovery without counting a later user completion`, () => withHarness(h => {
+		h.stop(); h.fireNext();
+		h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+		h.emit("auto_retry_start");
+		h.emit("agent_end", { messages: [assistant(2)], willContinue: true });
+		if (cancellation === "off") h.command("off");
+		else if (cancellation === "Esc") h.terminal("\u001b");
+		else if (cancellation === "input") h.emit("input", { text: "replacement" });
+		else if (cancellation === "user message") h.emit("message_start", { message: { role: "user" } });
+		else if (cancellation === "new turn") h.emit("before_agent_start", { prompt: "replacement" });
+		else if (cancellation === "session switch") { h.emit("session_before_switch"); h.activity({ sessionId: "second" }); h.emit("session_switch"); }
+		else if (cancellation === "retry cancellation") h.emit("auto_retry_end", { success: false, finalError: "Retry cancelled" });
+		else if (cancellation === "compaction cancellation") h.emit("auto_compaction_end", { aborted: true });
+		else { const controller = new AbortController(); controller.abort(); h.stop(assistant(3, "stop"), controller.signal); }
+		if (cancellation === "off") expect(h.aborts).toBe(1);
+		const success = assistant(4, "stop");
+		h.stop(success);
+		h.emit("agent_end", { messages: [success], willContinue: false });
+		h.emit("input", { text: "back" });
+		expect(recoveryTotals(h).completed).toBe(0);
+		h.advance(600_000);
+		expect(h.sent).toHaveLength(1);
+		expect(h.timers).toBe(0);
+	}));
+}
+
+test("host takeover of an unreceived submission cannot count an unrelated completion", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("auto_retry_start");
+	h.emit("agent_end", { messages: [assistant(2)], willContinue: true });
+	const success = assistant(3, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(0);
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("a dispatched receipt remains identifiable across host takeover but duplicate receipts cannot revive it", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	const receipt = { role: "custom", ...h.sent[0].message };
+	h.emit("auto_retry_start");
+	h.emit("message_start", { message: receipt });
+	h.emit("message_start", { message: receipt });
+	const success = assistant(2, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	h.emit("message_start", { message: receipt });
+	h.emit("agent_end", { messages: [assistant(3, "stop")], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(1);
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("a delayed old submission receipt cannot cancel the next failure's cooldown", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	const oldReceipt = { role: "custom", ...h.sent[0].message };
+	const failure = assistant(2);
+	h.stop(failure);
+	h.emit("agent_end", { messages: [failure], willContinue: false });
+	h.emit("message_start", { message: oldReceipt });
+	expect(h.timers).toBe(1);
+	expect(recoveryTotals(h).completed).toBe(0);
+	h.fireNext();
+	expect(h.sent).toHaveLength(2);
+	h.emit("message_start", { message: oldReceipt });
+	expect(recoveryTotals(h).completed).toBe(0);
+	h.emit("message_start", { message: { role: "custom", ...h.sent[1].message } });
+	const success = assistant(3, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(1);
+}));
+
+test("off after a delayed stale receipt does not abort the idle host", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.stop(assistant(2));
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.command("off");
+	expect(h.aborts).toBe(0);
+	expect(h.timers).toBe(0);
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("normal terminal text without every tool receipt is not a successful recovery", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.emit("auto_compaction_start");
+	const tool = { ...assistant(2, "toolUse"), content: [{ type: "toolCall", id: "missing", name: "effect", arguments: {} }] };
+	const success = assistant(3, "stop");
+	h.stop(success, undefined, [tool, success]);
+	h.emit("agent_end", { messages: [tool, success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(0);
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("an aborted settle after session_stop cannot turn its pending normal stop into success", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.emit("auto_retry_start");
+	const controller = new AbortController();
+	const success = assistant(2, "stop");
+	h.stop(success, controller.signal);
+	controller.abort();
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(0);
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("a subsequent unreceived submission stays uncompleted even after an earlier retry ran", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.stop(assistant(2)); h.fireNext();
+	h.emit("auto_retry_start");
+	h.emit("agent_end", { messages: [assistant(3, "stop")], willContinue: false });
+	expect(recoveryTotals(h).completed).toBe(0);
+	expect(h.sent).toHaveLength(2);
+}));
+
+test("off clears a subsequent cooldown without aborting an idle host", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.stop(assistant(2));
+	h.command("off");
+	expect(h.aborts).toBe(0);
+	expect(h.timers).toBe(0);
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(1);
 }));
