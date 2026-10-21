@@ -1,0 +1,48 @@
+= gskd craft
+
+工程协作 skill 与工具配套能力集合，覆盖任务续接、设计取舍、界面验证、交付复查和脉络回顾。
+skill 不限于 omp，可按目标宿主的约定接入。
+
+== skills
+
+* `gskd-orient`：处理任务执行中的补充、纠正、工作项插入、并行安排与暂停续接
+* `gskd-design-review`：检查设计取舍、责任边界、生命周期与实际接入
+* `gskd-gui-verification`：验证真实界面、输入交互及平台行为
+* `gskd-delivery-review`：对照已接受要求，核对实现、证据和交付边界
+* `gskd-recap`：梳理分析、决定、进展和续接位置，不自动执行历史任务
+
+各 skill 按需使用，不组成固定流水线；具体执行能力由宿主工具、权限和环境决定。
+
+== 目录
+
+`skills/` 下每个目录对应一个 skill，以 `SKILL.md` 为入口，补充资料放在各自的 `references/` 下。
+安装或迁移时保留完整目录，避免破坏相对引用。
+
+== 接入
+
+=== 通用方式
+
+按目标宿主的安装或发现约定接入 `skills/` 下的 skill 目录。
+
+=== omp
+
+将仓库克隆到独立源码目录，在仓库根执行一次：
+
+[source,shell]
+----
+omp plugin link .
+----
+
+omp 将仓库登记为 `gskd-craft` 包，之后启动新会话即可自动发现 skill，无需反复指定路径或复制文件。
+链接直接指向源码，不需要安装额外依赖，也不会搬迁现有配置、凭证或会话数据。
+
+使用命名 profile 时，在相应 profile 下登记：
+
+[source,shell]
+----
+omp --profile work plugin link .
+----
+
+== 更新
+
+更新仓库后，按宿主方式重新加载 skill。omp 用户启动新会话即可；仓库位置改变后，重新执行 `omp plugin link .`。
