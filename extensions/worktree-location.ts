@@ -206,7 +206,6 @@ interface Execution {
 	sequence: number;
 	observation: Omit<WorktreeObservation, "git" | "reason" | "checkedAt">;
 	confirmed: boolean;
-	ended: boolean;
 	controller: AbortController;
 	probe: Promise<{ inspection: Inspection; expected: ExpectedWorktree | null; expectedCheck: Inspection | undefined; sessionCheck: Inspection; bindingGeneration: number }>;
 }
@@ -288,12 +287,25 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		bindingController = undefined;
 	}
 
+	function inspectionQuery(signal: AbortSignal): (directory: string) => Promise<Inspection> {
+		const inspections = new Map<string, Promise<Inspection>>();
+		return (directory) => {
+			let inspection = inspections.get(directory);
+			if (!inspection) {
+				inspection = inspectGit(pi, directory, signal);
+				inspections.set(directory, inspection);
+			}
+			return inspection;
+		};
+	}
+
 	async function probe(directory: string, ctx: ExtensionContext, signal: AbortSignal): Execution["probe"] {
 		const expected = state.expected;
 		const binding = bindingGeneration;
-		const inspectionPromise = inspectGit(pi, directory, signal);
-		const checkPromise = expected ? (directory === expected.root ? inspectionPromise : inspectGit(pi, expected.root, signal)) : undefined;
-		const sessionPromise = directory === ctx.cwd ? inspectionPromise : inspectGit(pi, ctx.cwd, signal);
+		const inspect = inspectionQuery(signal);
+		const inspectionPromise = inspect(directory);
+		const checkPromise = expected ? inspect(expected.root) : undefined;
+		const sessionPromise = inspect(ctx.cwd);
 		const [inspection, check, session] = await Promise.all([inspectionPromise, checkPromise, sessionPromise]);
 		return { inspection, expected, expectedCheck: expected && check ? expectedInspection(expected, check) : undefined, sessionCheck: session, bindingGeneration: binding };
 	}
@@ -306,7 +318,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		if (!current(ctx, execution) || execution.sequence < selectedSequence) return;
 		selectedSequence = execution.sequence;
 		const result = await execution.probe;
-		if (!current(ctx, execution) || execution.sequence !== selectedSequence || (!execution.confirmed && !execution.ended)) return;
+		if (!current(ctx, execution) || execution.sequence !== selectedSequence || !execution.confirmed) return;
 		sessionCheck = result.sessionCheck;
 		if (state.expected === result.expected && bindingGeneration === result.bindingGeneration) expectedCheck = result.expectedCheck;
 		state = { ...state, latest: { ...execution.observation, ...result.inspection, checkedAt: Date.now() } };
@@ -322,7 +334,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		const observation = { ...declaredDirectory(args, ctx), toolCallId, observedAt: Date.now(), phase };
 		const execution: Execution = {
 			epoch, sessionId: ctx.sessionManager.getSessionId(), sequence: ++sequence, observation,
-			confirmed: false, ended: phase === "end", controller: pending, probe: probe(observation.directory, ctx, pending.signal),
+			confirmed: false, controller: pending, probe: probe(observation.directory, ctx, pending.signal),
 		};
 		executions.set(toolCallId, execution);
 		// Start is before the host's approval gate. Capture it, but publish only
@@ -351,11 +363,12 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		const binding = bindingGeneration;
 		if (!latest && !expected) return;
 		const pending = controller();
+		const inspect = inspectionQuery(pending.signal);
 		try {
 			const [inspection, check, session] = await Promise.all([
-				latest ? inspectGit(pi, latest.directory, pending.signal) : undefined,
-				expected ? inspectGit(pi, expected.root, pending.signal) : undefined,
-				inspectGit(pi, ctx.cwd, pending.signal),
+				latest ? inspect(latest.directory) : undefined,
+				expected ? inspect(expected.root) : undefined,
+				inspect(ctx.cwd),
 			]);
 			if (!active(ctx) || generation !== epoch || pending.signal.aborted || request !== refreshGeneration ||
 				state.latest !== latest || selected !== selectedSequence || binding !== bindingGeneration) return;
@@ -483,7 +496,6 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		const execution = executions.get(event.toolCallId);
 		if (!execution) return;
 		executions.delete(event.toolCallId);
-		execution.ended = true;
 		execution.controller.abort();
 		controllers.delete(execution.controller);
 		const details = object(event.result) && object(event.result.details) ? event.result.details : undefined;
