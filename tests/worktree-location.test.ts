@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import {
 	AgentRegistry, createAgentSession, SessionManager, Settings,
 	type AgentSession, type ExecOptions, type ExecResult, type ExtensionAPI,
-	type ExtensionUIContext, type ExtensionUiComponent, type ExtensionWidgetContent,
+	type ExtensionUIContext, type ExtensionUiComponent, type ExtensionWidgetContent, type ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { createNoOpUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
@@ -20,6 +20,20 @@ type QueryPhase = "command" | "start" | "end";
 
 interface QueryHold {
 	entered: Promise<void>;
+	release(): void;
+}
+
+interface ReceiptHold {
+	entered: Promise<ToolResultEvent>;
+	delivered: Promise<void>;
+	release(): void;
+}
+
+interface ReceiptControl {
+	id?: string;
+	entered(event: ToolResultEvent): void;
+	released: Promise<void>;
+	delivered(): void;
 	release(): void;
 }
 
@@ -50,6 +64,8 @@ interface LocationFixture {
 	command(args?: string): Promise<void>;
 	bash(directory?: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }): Promise<{ id: string; result: unknown; isError: boolean }>;
 	writeBash(directory: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }, controls?: { signal?: AbortSignal; onUpdate?(update: unknown): void }): Promise<{ id: string; result: unknown; isError: boolean }>;
+	holdBashReceipt(): ReceiptHold;
+	rewriteNextBash(from: string, to: string): void;
 	cancelSessionSwitch(): void;
 	close(): Promise<void>;
 }
@@ -149,6 +165,9 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 	let wireRequests = 0;
 	let extensionSends = 0;
 	let cancelSwitch = false;
+	let rewrite: { from: string; to: string } | undefined;
+	const receiptHolds = new Set<ReceiptControl>();
+	let armedReceipt: ReceiptControl | undefined;
 	const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
 		wireRequests++;
 		return Response.json({ error: { message: "No model call is permitted by this fixture" } }, { status: 400 });
@@ -197,6 +216,16 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 			extensions: [api => {
 				api.registerProvider(provider, { baseUrl: model.baseUrl, api: model.api,
 					apiKey: "local-only-not-a-secret", models: [model] });
+				// Delay only delivery to the observer, never execution or the SDK's
+				// authoritative input. This hook runs before the location extension.
+				api.on("tool_result", async event => {
+					if (event.toolName !== "bash" || !armedReceipt) return;
+					const hold = armedReceipt;
+					armedReceipt = undefined;
+					hold.id = event.toolCallId;
+					hold.entered(event);
+					await hold.released;
+				});
 				worktreeLocation(new Proxy(api, { get(target, property, receiver) {
 					if (property === "exec") return (command: string, args: string[], options?: ExecOptions) => gate.exec(target, command, args, options);
 					if (property === "sendMessage" || property === "sendUserMessage") {
@@ -205,6 +234,21 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 					}
 					return Reflect.get(target, property, receiver);
 				} }));
+				api.on("tool_result", event => {
+					if (event.toolName !== "bash") return;
+					for (const hold of receiptHolds) if (hold.id === event.toolCallId) {
+						receiptHolds.delete(hold);
+						hold.delivered();
+					}
+				});
+				// A later extension revises input after the location observer saw
+				// tool_call. The canonical wrapper alone knows what actually ran.
+				api.on("tool_call", event => {
+					if (event.toolName !== "bash" || !rewrite || event.input.cwd !== rewrite.from) return;
+					const cwd = rewrite.to;
+					rewrite = undefined;
+					return { input: { ...event.input, cwd } };
+				});
 				// Registered after the location observer: a before-switch event is
 				// only an attempted transition until this later hook accepts it.
 				api.on("session_before_switch", () => cancelSwitch ? { cancel: true } : undefined);
@@ -222,6 +266,18 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 		get dispatches() { return dispatches; }, get wireRequests() { return wireRequests; },
 		get extensionSends() { return extensionSends; },
 		cancelSessionSwitch() { cancelSwitch = true; },
+		rewriteNextBash(from, to) { rewrite = { from, to }; },
+		holdBashReceipt() {
+			if (armedReceipt) throw new Error("A canonical bash receipt is already armed");
+			const entered = Promise.withResolvers<ToolResultEvent>();
+			const released = Promise.withResolvers<void>();
+			const delivered = Promise.withResolvers<void>();
+			const hold = { entered: entered.resolve, released: released.promise, delivered: delivered.resolve,
+				release() { released.resolve(); } };
+			receiptHolds.add(hold);
+			armedReceipt = hold;
+			return { entered: entered.promise, delivered: delivered.promise, release: hold.release };
+		},
 		currentWidget() { return [...widgets.values()].find((widget): widget is ExtensionUiComponent => !Array.isArray(widget)); },
 		clearWidgets() {
 			for (const widget of widgets.values()) if (!Array.isArray(widget)) widget.dispose?.();
@@ -247,9 +303,9 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 			let result;
 			let isError = false;
 			try {
-				result = await tool.execute(id, args, undefined, update => {
+				result = await scope.run("end", () => tool.execute(id, args, undefined, update => {
 					void runner.emit({ type: "tool_execution_update", toolName: "bash", toolCallId: id, args, partialResult: update });
-				});
+				}));
 				isError = result.isError === true;
 			} catch (error) {
 				isError = true;
@@ -270,10 +326,10 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 			let result;
 			let isError = false;
 			try {
-				result = await tool.execute(id, args, controls.signal, update => {
+				result = await scope.run("end", () => tool.execute(id, args, controls.signal, update => {
 					void runner.emit({ type: "tool_execution_update", toolName: "write", toolCallId: id, args, partialResult: update })
 						.then(() => controls.onUpdate?.(update));
-				});
+				}));
 				isError = result.isError === true;
 			} catch (error) {
 				isError = true;
@@ -284,6 +340,7 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 		},
 		async close() {
 			gate.releaseAll();
+			for (const hold of receiptHolds) hold.release();
 			try { await session.dispose(); } finally {
 				server.stop(true); await rm(root, { recursive: true, force: true });
 			}
@@ -356,6 +413,7 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 	for (const switchSession of [false, true]) test(`a real xd bash cancelled after stdout ${switchSession ? "cannot write into a new session" : "still records its executed directory"}`, () => withFixture(async f => {
 		await f.writeBash(f.a);
 		const originalSession = f.session.sessionManager.getSessionId();
+		const canonical = f.holdBashReceipt();
 		const controller = new AbortController();
 		const progress = Promise.withResolvers<unknown>();
 		const entered = Promise.withResolvers<void>();
@@ -382,6 +440,9 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 			controller.abort();
 			const receipt = await pending;
 			expect(receipt.isError).toBe(true);
+			await canonical.entered;
+			canonical.release();
+			await canonical.delivered;
 			if (switchSession) {
 				expect(snapshot(f.session)?.latest ?? null).toBeNull();
 				expect(f.render()).toEqual([]);
@@ -394,7 +455,95 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 		} finally {
 			controller.abort();
 			released.resolve();
+			canonical.release();
 			try { await pending; } finally { server.stop(true); }
+		}
+	}, { deviceBash: true }));
+
+	test("a later extension's direct bash rewrite is recorded from canonical input rather than outer args", () => withFixture(async f => {
+		f.rewriteNextBash(f.a, f.b);
+		const receipt = await f.bash(f.a, "printf 'REWRITTEN_DIRECT_PWD='; pwd");
+		expect(receipt.isError).toBe(false);
+		expect(toolText(receipt.result)).toContain(`REWRITTEN_DIRECT_PWD=${f.b}`);
+		expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.b, toolCallId: receipt.id,
+			phase: "end", git: { root: f.b, branch: "worktree-b" } });
+	}));
+
+	for (const replacement of ["none", "newer C", "new session"] as const) test(`a canonical A-to-B receipt delayed past outer cancellation ${replacement === "none" ? "ultimately records B" : `cannot supersede ${replacement}`}`, () => withFixture(async f => {
+		await f.writeBash(f.a);
+		const previous = structuredClone(snapshot(f.session));
+		const previousEntries = f.session.sessionManager.getEntries().length;
+		const originalSession = f.session.sessionManager.getSessionId();
+		const canonical = f.holdBashReceipt();
+		f.rewriteNextBash(f.a, f.b);
+		const controller = new AbortController();
+		const progress = Promise.withResolvers<unknown>();
+		const entered = Promise.withResolvers<void>();
+		const released = Promise.withResolvers<void>();
+		const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch() {
+			entered.resolve();
+			await released.promise;
+			return new Response("released");
+		} });
+		const script = `await Bun.stdout.write("REWRITTEN_XD_PWD=" + process.cwd() + "\\n"); await fetch("http://127.0.0.1:${server.port}/");`;
+		const pending = f.writeBash(f.a, `${JSON.stringify(process.execPath)} -e '${script}'`, {}, {
+			signal: controller.signal,
+			onUpdate(update) {
+				if (toolText(update).includes("REWRITTEN_XD_PWD=")) progress.resolve(update);
+			},
+		});
+		try {
+			const [update] = await Promise.all([progress.promise, entered.promise]);
+			expect(toolText(update)).toContain(`REWRITTEN_XD_PWD=${f.b}`);
+			// Transport metadata still describes A even though real stdout proves B.
+			expect(update).toMatchObject({ details: { xdev: { tool: "bash", mode: "execute", args: { cwd: f.a } } } });
+			expect(snapshot(f.session)).toEqual(previous);
+			expect(f.session.sessionManager.getEntries()).toHaveLength(previousEntries);
+			expect(visible(f.render().join("\n"))).toMatch(/待确认|pending/i);
+			await f.command("status");
+			expect(f.notices.at(-1)).toMatch(/待确认|pending/i);
+			expect(snapshot(f.session)).toEqual(previous);
+			// Let real execution finish, but keep its canonical receipt outside the
+			// observer until the cancelled outer write has fully ended.
+			released.resolve();
+			const event = await canonical.entered;
+			expect(event.input.cwd).toBe(f.b);
+			expect(toolText(event)).toContain(`REWRITTEN_XD_PWD=${f.b}`);
+			controller.abort();
+			const outer = await pending;
+			expect(outer.isError).toBe(true);
+			expect(event.toolCallId).toBe(outer.id);
+			expect(snapshot(f.session)).toEqual(previous);
+			let newer: Snapshot | undefined;
+			if (replacement === "newer C") {
+				const current = await f.writeBash(f.other);
+				expect(current.isError).toBe(false);
+				expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.other, toolCallId: current.id });
+				newer = structuredClone(snapshot(f.session));
+			} else if (replacement === "new session") {
+				expect(await f.session.newSession()).toBe(true);
+				expect(f.session.sessionManager.getSessionId()).not.toBe(originalSession);
+				expect(snapshot(f.session)?.latest ?? null).toBeNull();
+			}
+			canonical.release();
+			await canonical.delivered;
+			if (replacement === "none") {
+				expect(f.session.sessionManager.getSessionId()).toBe(originalSession);
+				expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.b, source: "bash.cwd", toolCallId: outer.id,
+					phase: "end", git: { root: f.b, branch: "worktree-b" } });
+				expectVisibleLocation(f, f.b, "worktree-b");
+			} else if (replacement === "newer C") {
+				expect(snapshot(f.session)).toEqual(newer);
+				expectVisibleLocation(f, f.other, "shared-name");
+			} else {
+				expect(snapshot(f.session)?.latest ?? null).toBeNull();
+				expect(f.render()).toEqual([]);
+			}
+		} finally {
+			controller.abort();
+			released.resolve();
+			canonical.release();
+			try { await pending; await canonical.delivered; } finally { server.stop(true); }
 		}
 	}, { deviceBash: true }));
 
@@ -665,7 +814,7 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 		expect(f.notices.at(-1)).toContain("Recent branch: status-new");
 	}));
 
-	test("a status query cannot roll a completed execution back to its start observation", () => withFixture(async f => {
+	test("a status query cannot roll a completed execution back to the previous confirmed observation", () => withFixture(async f => {
 		await f.bash(f.a);
 		const endGate = f.gate.arm(f.b, "end");
 		const execution = f.bash(f.b);
@@ -673,6 +822,7 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 		let status: Promise<void> | undefined;
 		try {
 			await endGate.entered;
+			expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.a, phase: "end", git: { root: f.a } });
 			statusGate = f.gate.arm(snapshot(f.session)!.latest!.directory, "command");
 			status = f.command("status");
 			await statusGate.entered;

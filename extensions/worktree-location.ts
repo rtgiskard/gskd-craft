@@ -205,9 +205,18 @@ interface Execution {
 	sessionId: string;
 	sequence: number;
 	observation: Omit<WorktreeObservation, "git" | "reason" | "checkedAt">;
-	confirmed: boolean;
 	controller: AbortController;
 	probe: Promise<{ inspection: Inspection; expected: ExpectedWorktree | null; expectedCheck: Inspection | undefined; sessionCheck: Inspection; bindingGeneration: number }>;
+}
+
+interface ObservedCall {
+	epoch: number;
+	sessionId: string;
+	sequence: number;
+	confirmed: boolean;
+	receipt: boolean;
+	completion?: Promise<void>;
+	controller?: AbortController;
 }
 
 /** The state owner is factory-local, including in cloned/subagent extension instances. */
@@ -227,19 +236,22 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 	let serialized = "";
 	let bindingController: AbortController | undefined;
 	const controllers = new Set<AbortController>();
-	const executions = new Map<string, Execution>();
-	// Nested xd://bash calls have tool_call/result but no bash loop lifecycle.
-	// Retain their origin and streamed invocation evidence until the receipt.
-	const pendingCalls = new Map<string, { epoch: number; sessionId: string; confirmed: boolean; input: unknown }>();
-	const nestedCompletions = new Map<string, Promise<void>>();
+	const calls = new Map<string, ObservedCall>();
 
 	function active(ctx: ExtensionContext): boolean {
 		return !stopped && ctx.agent.kind === "main" && sessionId === ctx.sessionManager.getSessionId();
 	}
 
+	function awaitingInput(): boolean {
+		for (const call of calls.values()) {
+			if (call.confirmed && !call.receipt && call.sequence === selectedSequence) return true;
+		}
+		return false;
+	}
+
 	function render(ctx: ExtensionContext): void {
 		if (!active(ctx) || ctx.mode !== "tui" || !ctx.hasUI) return;
-		const text = formatWorktreeStatus({ state, expectedCheck, sessionCheck }, ctx.cwd);
+		const text = awaitingInput() ? "wt: 位置待确认 · 等待执行回执" : formatWorktreeStatus({ state, expectedCheck, sessionCheck }, ctx.cwd);
 		if (text === rendered) return;
 		rendered = text;
 		const generation = ++renderGeneration;
@@ -281,9 +293,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		bindingGeneration++;
 		for (const pending of controllers) pending.abort();
 		controllers.clear();
-		executions.clear();
-		pendingCalls.clear();
-		nestedCompletions.clear();
+		calls.clear();
 		bindingController = undefined;
 	}
 
@@ -318,7 +328,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		if (!current(ctx, execution) || execution.sequence < selectedSequence) return;
 		selectedSequence = execution.sequence;
 		const result = await execution.probe;
-		if (!current(ctx, execution) || execution.sequence !== selectedSequence || !execution.confirmed) return;
+		if (!current(ctx, execution) || execution.sequence !== selectedSequence) return;
 		sessionCheck = result.sessionCheck;
 		if (state.expected === result.expected && bindingGeneration === result.bindingGeneration) expectedCheck = result.expectedCheck;
 		state = { ...state, latest: { ...execution.observation, ...result.inspection, checkedAt: Date.now() } };
@@ -326,32 +336,27 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		render(ctx);
 	}
 
-	function begin(ctx: ExtensionContext, toolCallId: string, args: unknown, phase: "start" | "end" = "start"): Execution {
-		const previous = executions.get(toolCallId);
-		previous?.controller.abort();
-		if (previous) controllers.delete(previous.controller);
-		const pending = controller();
-		const observation = { ...declaredDirectory(args, ctx), toolCallId, observedAt: Date.now(), phase };
-		const execution: Execution = {
-			epoch, sessionId: ctx.sessionManager.getSessionId(), sequence: ++sequence, observation,
-			confirmed: false, controller: pending, probe: probe(observation.directory, ctx, pending.signal),
-		};
-		executions.set(toolCallId, execution);
-		// Start is before the host's approval gate. Capture it, but publish only
-		// after a tool-authored update/result proves actual tool invocation.
-		return execution;
+	function capture(ctx: ExtensionContext, toolCallId: string): ObservedCall {
+		let call = calls.get(toolCallId);
+		if (!call) {
+			call = { epoch, sessionId: ctx.sessionManager.getSessionId(), sequence: ++sequence, confirmed: false, receipt: false };
+			calls.set(toolCallId, call);
+		}
+		return call;
 	}
 
-	async function completeNested(ctx: ExtensionContext, toolCallId: string, input: unknown): Promise<void> {
-		const completed = begin(ctx, toolCallId, input, "end");
-		executions.delete(toolCallId);
-		completed.confirmed = true;
-		const completion = publish(ctx, completed);
-		nestedCompletions.set(toolCallId, completion);
-		try { await completion; } finally {
-			if (nestedCompletions.get(toolCallId) === completion) nestedCompletions.delete(toolCallId);
-			controllers.delete(completed.controller);
+	function confirm(ctx: ExtensionContext, call: ObservedCall): boolean {
+		if (call.epoch !== epoch || call.sessionId !== sessionId || call.sequence < selectedSequence) return false;
+		call.confirmed = true;
+		selectedSequence = call.sequence;
+		// Superseded calls no longer own publication or query resources.
+		for (const [id, previous] of calls) {
+			if (previous.sequence >= selectedSequence) continue;
+			previous.controller?.abort();
+			calls.delete(id);
 		}
+		render(ctx);
+		return true;
 	}
 
 	async function refresh(ctx: ExtensionContext): Promise<void> {
@@ -423,90 +428,63 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_call", (event, ctx) => {
-		if (active(ctx) && event.toolName === "bash" && !executions.has(event.toolCallId)) {
-			pendingCalls.set(event.toolCallId, { epoch, sessionId: ctx.sessionManager.getSessionId(), confirmed: false, input: event.input });
-		}
+		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId);
 	});
 	pi.on("tool_execution_start", (event, ctx) => {
-		if (active(ctx) && event.toolName === "bash") begin(ctx, event.toolCallId, event.args);
+		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId);
 	});
-	pi.on("tool_execution_update", async (event, ctx) => {
+	pi.on("tool_execution_update", (event, ctx) => {
 		if (!active(ctx)) return;
+		const call = calls.get(event.toolCallId);
+		if (!call || call.receipt) return;
 		if (event.toolName === "write") {
-			const call = pendingCalls.get(event.toolCallId);
 			const partial = event.partialResult;
 			const details = object(partial) && object(partial.details) ? partial.details : undefined;
 			const xdev = details?.xdev;
-			if (call && call.epoch === epoch && call.sessionId === sessionId && object(xdev) &&
-				xdev.tool === "bash" && xdev.mode === "execute") call.confirmed = true;
-			return;
-		}
-		if (event.toolName !== "bash") return;
-		const execution = executions.get(event.toolCallId);
-		if (!execution || execution.confirmed) return;
-		execution.confirmed = true;
-		await publish(ctx, execution);
+			if (!object(xdev) || xdev.tool !== "bash" || xdev.mode !== "execute") return;
+		} else if (event.toolName !== "bash") return;
+		confirm(ctx, call);
 	});
 	pi.on("tool_result", async (event, ctx) => {
 		if (!active(ctx) || event.toolName !== "bash") return;
-		let execution = executions.get(event.toolCallId);
-		if (!execution) {
-			const call = pendingCalls.get(event.toolCallId);
-			pendingCalls.delete(event.toolCallId);
-			if (!call || call.epoch !== epoch || call.sessionId !== sessionId ||
-				(!call.confirmed && !invocationResult(event.isError, event.details))) return;
-			// The canonical wrapper's receipt is also the completion boundary
-			// when the agent loop only emits start/end for the outer write tool.
-			await completeNested(ctx, event.toolCallId, event.input);
+		const call = calls.get(event.toolCallId);
+		if (!call || call.receipt) return;
+		if ((object(event.details) && event.details.executed === false) || (!call.confirmed && !invocationResult(event.isError, event.details))) {
+			calls.delete(event.toolCallId);
+			render(ctx);
 			return;
 		}
-		if (!current(ctx, execution)) return;
-		if (!execution.confirmed && !invocationResult(event.isError, event.details)) return;
-		const declared = declaredDirectory(event.input, ctx);
-		if (declared.directory !== execution.observation.directory || declared.source !== execution.observation.source) {
-			execution = begin(ctx, event.toolCallId, event.input);
-		}
-		if (!execution.confirmed) {
-			execution.confirmed = true;
-			await publish(ctx, execution);
+		call.receipt = true;
+		if (!confirm(ctx, call)) return;
+		const pending = controller();
+		call.controller = pending;
+		const observation = { ...declaredDirectory(event.input, ctx), toolCallId: event.toolCallId, phase: "end" as const, observedAt: Date.now() };
+		const execution: Execution = {
+			epoch: call.epoch, sessionId: call.sessionId, sequence: call.sequence, observation,
+			controller: pending, probe: probe(observation.directory, ctx, pending.signal),
+		};
+		call.completion = publish(ctx, execution);
+		try { await call.completion; } finally {
+			controllers.delete(pending);
+			if (calls.get(event.toolCallId) === call) calls.delete(event.toolCallId);
 		}
 	});
 	pi.on("tool_approval_resolved", (event, ctx) => {
 		if (!active(ctx) || event.toolName !== "bash" || event.approved) return;
-		pendingCalls.delete(event.toolCallId);
-		const execution = executions.get(event.toolCallId);
-		if (!execution) return;
-		execution.controller.abort();
-		controllers.delete(execution.controller);
-		executions.delete(event.toolCallId);
+		const call = calls.get(event.toolCallId);
+		call?.controller?.abort();
+		calls.delete(event.toolCallId);
+		render(ctx);
 	});
 	pi.on("tool_execution_end", async (event, ctx) => {
 		if (!active(ctx)) return;
-		const call = pendingCalls.get(event.toolCallId);
-		pendingCalls.delete(event.toolCallId);
-		if (event.toolName !== "bash") {
-			const completion = nestedCompletions.get(event.toolCallId);
-			if (completion) { await completion; return; }
-			// Cancellation may end the outer write before its inner receipt arrives.
-			if (event.toolName === "write" && call?.confirmed && call.epoch === epoch && call.sessionId === sessionId) {
-				await completeNested(ctx, event.toolCallId, call.input);
-			}
-			return;
-		}
-		const execution = executions.get(event.toolCallId);
-		if (!execution) return;
-		executions.delete(event.toolCallId);
-		execution.controller.abort();
-		controllers.delete(execution.controller);
-		const details = object(event.result) && object(event.result.details) ? event.result.details : undefined;
-		if (details?.executed === false || (!execution.confirmed && !invocationResult(event.isError, details))) return;
-		const pending = controller();
-		const completed: Execution = {
-			...execution, sequence: ++sequence, confirmed: true, controller: pending,
-			observation: { ...execution.observation, phase: "end", observedAt: Date.now() },
-			probe: probe(execution.observation.directory, ctx, pending.signal),
-		};
-		try { await publish(ctx, completed); } finally { controllers.delete(pending); }
+		const call = calls.get(event.toolCallId);
+		if (!call) return;
+		if (call.completion) { await call.completion; return; }
+		// Outer cancellation ends waiting, not the canonical invocation. Only
+		// its receipt can confirm effective input; retain eligible evidence.
+		if (!call.confirmed) calls.delete(event.toolCallId);
+		render(ctx);
 	});
 
 	pi.registerCommand("gskd-worktree", {
@@ -518,7 +496,10 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 			if (action === "status") {
 				const generation = epoch;
 				await refresh(ctx);
-				if (active(ctx) && generation === epoch) notify(ctx, formatWorktreeDetails({ state, expectedCheck, sessionCheck }));
+				if (active(ctx) && generation === epoch) notify(ctx, [
+					...(awaitingInput() ? ["Current execution location: pending authoritative receipt (位置待确认). The recent location below is the last confirmed observation."] : []),
+					formatWorktreeDetails({ state, expectedCheck, sessionCheck }),
+				].join("\n"));
 				return;
 			}
 			if (action === "clear") {
