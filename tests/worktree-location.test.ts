@@ -8,12 +8,14 @@ import { pathToFileURL } from "node:url";
 import {
 	AgentRegistry, createAgentSession, SessionManager, Settings,
 	type AgentSession, type ExecOptions, type ExecResult, type ExtensionAPI,
-	type ExtensionUIContext, type ExtensionUiComponent, type ExtensionWidgetContent, type ToolResultEvent,
+	type ExtensionUIContext, type ExtensionUiComponent, type ExtensionWidgetContent, type ExtensionWidgetOptions, type ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { createNoOpUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/utils";
+import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
+import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
-import { visibleWidth, type TUI } from "@oh-my-pi/pi-tui";
+import { Container, visibleWidth, type TUI } from "@oh-my-pi/pi-tui";
 import worktreeLocation, { type WorktreeLocationState as Snapshot } from "../extensions/worktree-location";
 
 type QueryPhase = "command" | "start" | "end";
@@ -61,6 +63,7 @@ interface LocationFixture {
 	currentWidget(): ExtensionUiComponent | undefined;
 	clearWidgets(): void;
 	render(width?: number): string[];
+	renderLayout(width?: number): string[];
 	command(args?: string): Promise<void>;
 	bash(directory?: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }): Promise<{ id: string; result: unknown; isError: boolean }>;
 	writeBash(directory: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }, controls?: { signal?: AbortSignal; onUpdate?(update: unknown): void }): Promise<{ id: string; result: unknown; isError: boolean }>;
@@ -159,6 +162,18 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 	const widgets = new Map<string, string[] | ExtensionUiComponent>();
 	const theme = (await getThemeByName("dark"))!;
 	const tui = { requestRender() {} } as TUI;
+	const above = new Container();
+	const below = new Container();
+	const controller = new ExtensionUiController({
+		hookWidgetContainerAbove: above, hookWidgetContainerBelow: below,
+		// An unoccupied status row keeps the existing editor gap stable across composer shapes.
+		statusRowOccupied: false, ui: tui,
+	} as InteractiveModeContext);
+	const layout = new Container();
+	layout.addChild({ render: () => ["RUNNING · TOPIC"] });
+	layout.addChild(above);
+	layout.addChild({ render: () => ["> INPUT"] });
+	layout.addChild(below);
 	const forbiddenUi: string[] = [];
 	let uiChanges = 0;
 	let dispatches = 0;
@@ -182,11 +197,14 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 		...createNoOpUIContext(),
 		notify: (message: string) => notices.push(message),
 		onTerminalInput: () => () => {},
-		setWidget: (key: string, content: ExtensionWidgetContent) => {
-			const previous = widgets.get(key);
-			if (previous && !Array.isArray(previous)) previous.dispose?.();
+		setWidget: (key: string, content: ExtensionWidgetContent, options?: ExtensionWidgetOptions) => {
 			widgets.delete(key);
-			if (content) widgets.set(key, Array.isArray(content) ? content : content(tui, theme));
+			controller.setHookWidget(key, typeof content === "function" ? hostTui => {
+				const widget = content(hostTui, theme);
+				widgets.set(key, widget);
+				return widget;
+			} : content, options);
+			if (Array.isArray(content)) widgets.set(key, content);
 			uiChanges++;
 		},
 		setStatus: () => { forbiddenUi.push("setStatus"); },
@@ -280,12 +298,13 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 		},
 		currentWidget() { return [...widgets.values()].find((widget): widget is ExtensionUiComponent => !Array.isArray(widget)); },
 		clearWidgets() {
-			for (const widget of widgets.values()) if (!Array.isArray(widget)) widget.dispose?.();
+			for (const key of widgets.keys()) controller.setHookWidget(key, undefined);
 			widgets.clear();
 		},
 		render(width = 240): string[] {
 			return [...widgets.values()].flatMap(widget => Array.isArray(widget) ? widget : widget.render(width));
 		},
+		renderLayout(width = 240): string[] { return [...layout.render(width)]; },
 		async command(args = "") {
 			const beforeErrors = errors.length;
 			await scope.run("command", () => session.prompt(`/gskd-worktree${args ? ` ${args}` : ""}`));
@@ -361,6 +380,18 @@ function expectVisibleLocation(f: LocationFixture, root: string, branch: string)
 }
 
 describe("worktree location through the real SDK and Git worktrees (no model provider required)", () => {
+	test("worktree stays right-aligned below input without moving existing rows or adding a blank", () => withFixture(async f => {
+		const width = 80;
+		const before = f.renderLayout(width).map(visible);
+		await f.bash(f.b);
+		const after = f.renderLayout(width).map(visible);
+		expect(after.slice(0, before.length)).toEqual(before);
+		expect(after.slice(before.length)).toEqual([expect.stringMatching(/wt:.*checkout-b.*worktree-b$/)]);
+		expect(visibleWidth(after.at(-1)!)).toBe(width);
+		await f.bash(f.a);
+		expect(f.renderLayout(width).map(visible)).toEqual(before);
+	}));
+
 	test("unbound execution is observation only, with provenance and a bounded single-line widget", () => withFixture(async f => {
 		const receipt = await f.bash(f.b);
 		expect(receipt.isError).toBe(false);

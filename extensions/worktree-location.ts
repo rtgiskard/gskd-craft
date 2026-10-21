@@ -267,7 +267,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 				// mounting its successor. Only the current owner can drop its cache.
 				if (generation === renderGeneration) rendered = undefined;
 			},
-		}), { placement: "aboveEditor" });
+		}), { placement: "belowEditor" });
 	}
 
 	function notify(ctx: ExtensionContext, message: string, warning = false): void {
