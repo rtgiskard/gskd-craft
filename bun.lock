@@ -7,6 +7,7 @@
       "devDependencies": {
         "@oh-my-pi/pi-ai": "18.12.5",
         "@oh-my-pi/pi-coding-agent": "18.12.5",
+        "@oh-my-pi/pi-tui": "18.12.5",
       },
     },
   },

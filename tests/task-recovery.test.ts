@@ -53,7 +53,9 @@ function harness(): Harness {
 	const ctx = {
 		get agent() { return { kind }; }, mode: "tui", hasUI: true,
 		sessionManager: { getSessionId: () => sessionId, getLeafId: () => leafId },
-		ui: { setStatus: (_key: string, value: string) => status.push(value),
+		ui: { setWidget: (_key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) => {
+			status.push(content ? content(undefined, { fg: (_color: string, text: string) => text }).render(80).join("\n") : "");
+		},
 			notify: (message: string) => notices.push(message),
 			onTerminalInput: (handler: (data: string) => unknown) => { input = handler; return () => { input = undefined; }; } },
 		isIdle: () => idle, hasPendingMessages: () => pending,
@@ -122,6 +124,54 @@ test("status and invalid command diagnostics never enter model context or cancel
 	h.fireNext();
 	expect(h.sent).toHaveLength(1);
 }));
+
+test("recovery hint exists only during cooldown and clears before normal work resumes", () => withHarness(h => {
+	expect(h.status.at(-1)).toBe("");
+	h.stop();
+	expect(h.status.at(-1)).toContain("Recovery");
+	h.fireNext();
+	expect(h.status.at(-1)).toBe("");
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	expect(h.status.at(-1)).toBe("");
+	h.stop(assistant(2));
+	expect(h.status.at(-1)).toContain("Recovery");
+	h.command("off");
+	expect(h.status.at(-1)).toBe("");
+}));
+
+test("multiple retries count as one completed recovery and notify only on the next input", () => withHarness(h => {
+	h.stop(); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+	h.stop(assistant(2)); h.fireNext();
+	h.emit("message_start", { message: { role: "custom", ...h.sent[1].message } });
+	h.advance(2500);
+	const elapsed = Math.ceil(h.now / 1000);
+	const completedAt = new Date(h.now).toISOString();
+	const success = assistant(3, "stop");
+	h.stop(success);
+	h.emit("agent_end", { messages: [success], willContinue: false });
+	expect(h.notices).toEqual([]);
+	h.emit("input", { text: "I'm back", source: "interactive" });
+	expect(h.notices).toEqual([`Automatic recovery completed 1 time(s) since your last input; total recovery time ${elapsed}s; last completed ${completedAt}.`]);
+	h.emit("input", { text: "next input", source: "interactive" });
+	expect(h.notices).toHaveLength(1);
+	h.command("status");
+	expect(h.notices).toContain(`Completed recoveries: 1; total recovery time: ${elapsed}s; last completed: ${completedAt}.`);
+}));
+
+for (const outcome of ["submitted", "aborted", "error", "user replacement", "session switch"] as const) {
+	test(`${outcome} does not count as a successful recovery`, () => withHarness(h => {
+		h.stop(); h.fireNext();
+		if (outcome !== "submitted") h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+		if (outcome === "user replacement") h.emit("input", { text: "replacement" });
+		if (outcome === "session switch") { h.emit("session_before_switch"); h.activity({ sessionId: "second" }); h.emit("session_switch"); }
+		h.stop(assistant(3, outcome === "aborted" ? "aborted" : outcome === "error" ? "error" : "stop"));
+		h.emit("input", { text: "back" });
+		expect(h.notices).toEqual([]);
+		h.command("status");
+		expect(h.notices).toContain("Completed recoveries: 0; total recovery time: 0s; last completed: never.");
+	}));
+}
 
 for (const cancellation of ["off", "Esc", "Ctrl-C", "new input", "new turn", "session transition", "signal abort", "shutdown"] as const) {
 	test(`${cancellation} invalidates a cooling recovery and a late duplicate failure`, () => withHarness(h => {

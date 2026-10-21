@@ -1,5 +1,6 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { truncateToWidth } from "@oh-my-pi/pi-tui";
 import { classifyFailure, recoveryDelay, type RecoveryFailure } from "./recovery-policy";
 
 const STATUS_KEY = "gskd-recovery";
@@ -17,6 +18,7 @@ interface Recovery {
 	failure: RecoveryFailure;
 	phase: Phase;
 	deadline: number;
+	startedAt: number;
 	timer?: Timer;
 	detachAbort?: () => void;
 }
@@ -57,17 +59,34 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	let diagnostic = "idle";
 	let unsubscribeInput: (() => void) | undefined;
 	let terminalFailureKey: string | undefined;
+	let statisticsSessionId: string | undefined;
+	let statistics = { completed: 0, elapsedMs: 0, lastCompletedAt: 0, pending: 0, pendingElapsedMs: 0 };
+
+	function reportPending(ctx: ExtensionContext): void {
+		if (ctx.agent.kind !== "main" || !statistics.pending) return;
+		notify(ctx, `Automatic recovery completed ${statistics.pending} time(s) since your last input; total recovery time ${Math.ceil(statistics.pendingElapsedMs / 1000)}s; last completed ${new Date(statistics.lastCompletedAt).toISOString()}.`);
+		statistics.pending = 0;
+		statistics.pendingElapsedMs = 0;
+	}
 
 	function active(ctx: ExtensionContext): boolean {
 		return ctx.agent.kind === "main" && (enabled ?? true);
 	}
 
 	function render(ctx: ExtensionContext): void {
-		if (ctx.agent.kind !== "main") return;
-		const state = !active(ctx) ? "off" : recovery
-			? `${recovery.phase} #${attempts}${recovery.phase === "cooldown" ? ` (${Math.max(0, Math.ceil((recovery.deadline - Date.now()) / 1000))}s)` : ""}`
-			: diagnostic;
-		ctx.ui.setStatus(STATUS_KEY, `recovery: ${state}`);
+		if (ctx.agent.kind !== "main" || ctx.mode !== "tui" || !ctx.hasUI) return;
+		if (!active(ctx) || recovery?.phase !== "cooldown") {
+			ctx.ui.setWidget(STATUS_KEY, undefined);
+			return;
+		}
+		const seconds = Math.max(0, Math.ceil((recovery.deadline - Date.now()) / 1000));
+		const detail = ` · retry #${attempts} after ${seconds}s · Esc to cancel`;
+		ctx.ui.setWidget(STATUS_KEY, (_tui, theme) => ({
+			render(width) {
+				if (width <= 0) return [];
+				return [truncateToWidth(theme.fg("warning", "Recovery") + theme.fg("dim", detail), width)];
+			},
+		}), { placement: "aboveEditor" });
 	}
 
 	function release(ctx: ExtensionContext): void {
@@ -149,10 +168,21 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		if (recovery?.failureKey === key || terminalFailureKey === key) return;
 		const failure = classifyFailure(message);
 		if (!failure) {
+			// A submitted retry is not a success; only its settled, normal completion counts.
+			if (recovery?.phase === "running" && message.stopReason === "stop" && unpairedCalls(messages).length === 0) {
+				const now = Date.now();
+				const elapsedMs = Math.max(0, now - recovery.startedAt);
+				statistics.completed++;
+				statistics.elapsedMs += elapsedMs;
+				statistics.lastCompletedAt = now;
+				statistics.pending++;
+				statistics.pendingElapsedMs += elapsedMs;
+			}
 			invalidate(ctx, message.stopReason === "error" ? "not a recoverable communication failure" : message.stopReason === "aborted" ? "cancelled" : "idle");
 			terminalFailureKey = key;
 			return;
 		}
+		const startedAt = recovery?.startedAt ?? Date.now();
 		release(ctx);
 		terminalFailureKey = key;
 		const missing = unpairedCalls(messages);
@@ -173,6 +203,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		const plan: Recovery = {
 			generation, sessionId: ctx.sessionManager.getSessionId(), leafId: ctx.sessionManager.getLeafId(),
 			failureKey: key, failure, phase: "cooldown", deadline: Date.now() + recoveryDelay(attempts, failure.retryAfterMs),
+			startedAt,
 		};
 		recovery = plan;
 		if (signal) {
@@ -185,6 +216,11 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	}
 
 	function bind(ctx: ExtensionContext): void {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (statisticsSessionId !== sessionId) {
+			statisticsSessionId = sessionId;
+			statistics = { completed: 0, elapsedMs: 0, lastCompletedAt: 0, pending: 0, pendingElapsedMs: 0 };
+		}
 		unsubscribeInput?.();
 		unsubscribeInput = undefined;
 		if (ctx.agent.kind === "main" && ctx.mode === "tui") {
@@ -205,6 +241,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		bind(ctx);
 	});
 	pi.on("input", (event, ctx) => {
+		reportPending(ctx);
 		if (!/^\/gskd-recovery(?:\s|$)/.test(event.text.trim())) invalidate(ctx, "superseded by user input");
 	});
 	pi.on("before_agent_start", (event, ctx) => {
@@ -248,12 +285,13 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		invalidate(ctx, "shutdown");
 		unsubscribeInput?.();
 		unsubscribeInput = undefined;
-		ctx.ui.setStatus(STATUS_KEY, undefined);
+		ctx.ui.setWidget(STATUS_KEY, undefined);
 	});
 
 	pi.registerCommand("gskd-recovery", {
 		description: "Show or control automatic communication-failure recovery: status | on | off",
 		handler: async (args, ctx) => {
+			reportPending(ctx);
 			const action = args.trim() || "status";
 			if (action === "off") {
 				const ownTurnRunning = recovery?.phase === "running";
@@ -269,6 +307,8 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 			}
 			render(ctx);
 			const state = recovery ? `${recovery.phase}; attempt=${attempts}; probes=${probes}/${MAX_PROBES}; reason=${recovery.failure.reason}; retryAt=${new Date(recovery.deadline).toISOString()}` : diagnostic;
+			const summary = `Completed recoveries: ${statistics.completed}; total recovery time: ${Math.ceil(statistics.elapsedMs / 1000)}s; last completed: ${statistics.completed ? new Date(statistics.lastCompletedAt).toISOString() : "never"}.`;
+			notify(ctx, summary);
 			notify(ctx, `gskd-recovery: ${active(ctx) ? "on" : "off"}; ${state}. Main sessions only. Cooldown: 30/60/120/300s + jitter, respecting available retry hints. Existing receipts retained. Cancellation uses settle AbortSignal and TUI Esc/Ctrl-C; raw non-TUI aborts without a settle signal and already dispatched void submissions cannot be retracted by the public API.`);
 		},
 	});
