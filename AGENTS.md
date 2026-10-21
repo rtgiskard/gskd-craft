@@ -11,6 +11,6 @@ Applies to this skill repository, not consuming projects
 
 ## Commits
 
-- Use concise Conventional Commit subjects; omit redundant bodies
-- Keep body items brief and information-dense: group meaningful changes, explain intent or boundaries when needed, and avoid restating the subject or diff
+- Use concise Conventional Commit subjects that capture the main changes in behavior or responsibility, not just the editing activity
+- Omit redundant bodies; add brief, grouped items only for meaningful changes, intent, or boundaries the subject cannot convey. Avoid file lists, diff narration, and restating the subject
 - Use real newlines and `- ` items, without terminal punctuation or blank lines between items; capitalization is optional
