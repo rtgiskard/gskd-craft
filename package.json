@@ -1,7 +1,16 @@
 {
   "name": "gskd-craft",
   "version": "0.0.0",
-  "description": "gskd craft engineering collaboration skills",
+  "description": "gskd craft engineering collaboration skills and omp extensions",
   "private": true,
-  "omp": {}
+  "omp": {
+    "extensions": ["./extensions/task-recovery.ts"]
+  },
+  "scripts": {
+    "test": "bun test --timeout 240000"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.12.5",
+    "@oh-my-pi/pi-ai": "18.12.5"
+  }
 }
