@@ -4,7 +4,7 @@
   "description": "gskd craft engineering collaboration skills and omp extensions",
   "private": true,
   "omp": {
-    "extensions": ["./extensions/task-recovery.ts"]
+    "extensions": ["./extensions/task-recovery.ts", "./extensions/worktree-location.ts"]
   },
   "scripts": {
     "test": "bun test --timeout 240000"
@@ -12,6 +12,7 @@
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "18.12.5",
     "@oh-my-pi/pi-ai": "18.12.5",
+    "@oh-my-pi/pi-catalog": "18.12.5",
     "@oh-my-pi/pi-tui": "18.12.5"
   }
 }
