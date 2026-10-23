@@ -5,6 +5,7 @@ import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, write
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { exportSessions, type ExportOptions, type ExportResult } from "../extensions/session-export-core";
+import { StatsStore, type StatsEvent } from "../extensions/skill-stats-core";
 
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -30,6 +31,23 @@ async function fixture() {
 		return path;
 	}
 	return { root, options, put, session };
+}
+
+function recordStatistics(sourceDir: string, events: StatsEvent[]): void {
+	const store = new StatsStore(join(sourceDir, "gskd-skill-insights.sqlite"));
+	cleanups.push(() => store.close());
+	for (const event of events) store.record(event);
+}
+
+function statisticsEvents(cwd: string): StatsEvent[] {
+	return [
+		{ id: "read-1", kind: "read", at: 1, cwd, session: "session-1", agent: "Main", branch: null,
+			data: { skill: "gskd-orient", path: "/skills/gskd-orient/SKILL.md", target: "entry" } },
+		{ id: "analysis-1", kind: "analysis", at: 2, cwd, session: "session-1", agent: "Main", branch: "branch-1",
+			data: { status: "completed", coverage: { from: "event-1", through: "event-7" }, candidates: [{ skill: "gskd-orient", text: "Possible improvement" }] } },
+		{ id: "feedback-1", kind: "feedback", at: 3, cwd, session: "session-1", agent: "Main", branch: "branch-1",
+			data: { skill: "gskd-orient", text: "Explicit feedback with raw /private/path and user@example.test" } },
+	];
 }
 
 interface Manifest { files: Array<{ path: string; bytes: number; sha256: string }> }
@@ -220,6 +238,108 @@ describe("session export snapshot behavior", () => {
 		const path = await f.session("a/main.jsonl");
 		await appendFile(path, JSON.stringify({ type: "message", data: `blob:sha256:${"a".repeat(64)}` }) + "\n");
 		await expect(exportSessions(f.options)).rejects.toThrow();
+	});
+
+	test("stats attaches a hashed logical snapshot without changing default exports", async () => {
+		const f = await fixture();
+		await f.session("a/main.jsonl");
+		const events = statisticsEvents(f.options.cwd);
+		recordStatistics(f.options.sourceDir, events);
+		const ordinary = await unpack(await exportSessions(f.options), f.root);
+		expect(ordinary.included).toEqual(["sessions/a/main.jsonl"]);
+		const result = await exportSessions({ ...f.options, stats: true });
+		const archive = await unpack(result, f.root);
+		expect(archive.included).toEqual(["sessions/a/main.jsonl", "statistics.json"]);
+		expect(result.files).toBe(2);
+		const bytes = await readFile(join(archive.directory, "statistics.json"));
+		const statistics = JSON.parse(bytes.toString("utf8"));
+		expect(statistics.version).toBe(1);
+		expect(statistics.events).toEqual(events);
+		expect(archive.manifest.files.find(file => file.path === "statistics.json")).toEqual({
+			path: "statistics.json", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+		});
+	});
+
+	test("stats-only ignores session storage and custom session paths", async () => {
+		const f = await fixture();
+		recordStatistics(f.options.sourceDir, statisticsEvents(f.options.cwd));
+		await rm(join(f.options.sourceDir, "sessions"), { recursive: true });
+		await symlink(join(f.root, "unavailable-sessions"), join(f.options.sourceDir, "sessions"));
+		const result = await exportSessions({ ...f.options, statsOnly: true, sessionDir: join(f.root, "unavailable-custom-sessions") });
+		const archive = await unpack(result, f.root);
+		expect(archive.included).toEqual(["statistics.json"]);
+		expect((await readdir(archive.directory)).sort()).toEqual(["manifest.json", "statistics.json"]);
+		expect(result.files).toBe(1);
+		expect((await stat(result.archive!)).mode & 0o777).toBe(0o600);
+	});
+
+	test("statistics obey project and all scopes from the explicit source root", async () => {
+		const f = await fixture();
+		const sourceDir = join(f.root, "explicit-agent");
+		await mkdir(sourceDir);
+		const project = statisticsEvents(f.options.cwd);
+		const other: StatsEvent = { ...project[0]!, id: "other-read", cwd: join(f.root, "other-project") };
+		recordStatistics(f.options.sourceDir, [{ ...project[0]!, id: "wrong-source" }]);
+		recordStatistics(sourceDir, [...project, other]);
+		const options = { ...f.options, sourceDir, statsOnly: true };
+		const current = await unpack(await exportSessions(options), f.root);
+		const all = await unpack(await exportSessions({ ...options, all: true }), f.root);
+		expect(JSON.parse(await readFile(join(current.directory, "statistics.json"), "utf8")).events).toEqual(project);
+		const allEvents: StatsEvent[] = JSON.parse(await readFile(join(all.directory, "statistics.json"), "utf8")).events;
+		expect(allEvents).toHaveLength(project.length + 1);
+		expect(allEvents).toEqual(expect.arrayContaining([...project, other]));
+		expect(current.included).toEqual(["statistics.json"]);
+		expect(all.included).toEqual(["statistics.json"]);
+	});
+
+	for (const statsOnly of [false, true]) {
+		test(`${statsOnly ? "stats-only" : "stats"} retains statistics recorded under a symlink cwd`, async () => {
+			const f = await fixture();
+			const cwd = join(f.root, "linked-project");
+			await symlink(f.options.cwd, cwd);
+			await f.session("a/main.jsonl", cwd);
+			const events = statisticsEvents(cwd);
+			recordStatistics(f.options.sourceDir, events);
+			const archive = await unpack(await exportSessions({ ...f.options, cwd, stats: true, statsOnly }), f.root);
+			expect(JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8")).events).toEqual(events);
+			expect(archive.included).toEqual(statsOnly ? ["statistics.json"] : ["sessions/a/main.jsonl", "statistics.json"]);
+		});
+	}
+
+	test("missing statistics export an empty snapshot without creating a database", async () => {
+		const f = await fixture();
+		await rm(join(f.options.sourceDir, "sessions"), { recursive: true });
+		const archive = await unpack(await exportSessions({ ...f.options, statsOnly: true }), f.root);
+		const statistics = JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8"));
+		expect(statistics.version).toBe(1);
+		expect(statistics.events).toEqual([]);
+		expect(await readdir(f.options.sourceDir)).toEqual([]);
+	});
+
+	test("stats still exports statistics when no sessions match", async () => {
+		const f = await fixture();
+		await f.session("other/main.jsonl", join(f.root, "other-project"));
+		recordStatistics(f.options.sourceDir, statisticsEvents(f.options.cwd));
+		const archive = await unpack(await exportSessions({ ...f.options, stats: true }), f.root);
+		expect(archive.included).toEqual(["statistics.json"]);
+	});
+
+	for (const suffix of ["", "-wal", "-shm"]) {
+		test(`statistics refuse a linked database${suffix} without publishing an archive`, async () => {
+			const f = await fixture();
+			const outside = join(f.root, "outside-statistics");
+			await f.put(outside, "not an export source");
+			await symlink(outside, join(f.options.sourceDir, `gskd-skill-insights.sqlite${suffix}`));
+			await expect(exportSessions({ ...f.options, statsOnly: true })).rejects.toThrow("symbolic link");
+			expect(await readdir(f.options.outputDir)).toEqual([]);
+		});
+	}
+
+	test("stats-only retains output containment and cancellation protections", async () => {
+		const f = await fixture();
+		await expect(exportSessions({ ...f.options, statsOnly: true, outputDir: join(f.options.sourceDir, "sessions/export") })).rejects.toThrow("outside session storage");
+		await expect(exportSessions({ ...f.options, statsOnly: true, signal: AbortSignal.abort() })).rejects.toThrow();
+		expect(await readdir(f.options.sourceDir)).toEqual(["sessions"]);
 	});
 
 	test("empty scope and cancellation produce no archive", async () => {

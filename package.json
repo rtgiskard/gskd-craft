@@ -4,7 +4,7 @@
   "description": "gskd craft engineering collaboration skills and omp extensions",
   "private": true,
   "omp": {
-    "extensions": ["./extensions/task-recovery.ts", "./extensions/worktree-location.ts", "./extensions/display-preset.ts", "./extensions/session-export.ts"]
+    "extensions": ["./extensions/task-recovery.ts", "./extensions/worktree-location.ts", "./extensions/display-preset.ts", "./extensions/session-export.ts", "./extensions/skill-insights.ts"]
   },
   "scripts": {
     "test": "bun test --timeout 240000"
