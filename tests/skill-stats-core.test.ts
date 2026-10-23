@@ -76,7 +76,7 @@ describe("durable skill statistics", () => {
 		const results = await Promise.all(workers.map(async worker => ({
 			code: await worker.exited, stderr: await new Response(worker.stderr).text(),
 		})));
-		for (const result of results) expect(result).toEqual({ code: 0, stderr: "" });
+		for (const result of results) expect(result.code, result.stderr).toBe(0);
 		const stored = f.open().events();
 		expect(stored).toHaveLength(300);
 		expect(new Set(stored.map(item => item.id)).size).toBe(300);

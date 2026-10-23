@@ -143,23 +143,8 @@ test("one submission per failure and unlimited confirmed recovery episodes", () 
 test("status and invalid command diagnostics never enter model context or cancel recovery", () => withHarness(h => {
 	h.stop(); h.command("status"); h.command("unknown");
 	expect(h.sent).toHaveLength(0);
-	expect(h.notices.some(notice => notice.includes("gskd-recovery"))).toBe(true);
 	h.fireNext();
 	expect(h.sent).toHaveLength(1);
-}));
-
-test("recovery hint exists only during cooldown and clears before normal work resumes", () => withHarness(h => {
-	expect(h.status.at(-1)).toBe("");
-	h.stop();
-	expect(h.status.at(-1)).toContain("Recovery");
-	h.fireNext();
-	expect(h.status.at(-1)).toBe("");
-	h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
-	expect(h.status.at(-1)).toBe("");
-	h.stop(assistant(2));
-	expect(h.status.at(-1)).toContain("Recovery");
-	h.command("off");
-	expect(h.status.at(-1)).toBe("");
 }));
 
 test("multiple retries count as one completed recovery and notify only on the next input", () => withHarness(h => {

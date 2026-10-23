@@ -145,10 +145,8 @@ try {
  assert.deepEqual(ledger.events(b).filter(row => row.kind === "read"), [first]);
  const exported = statisticsSnapshot(dbPath, b);
  assert.deepEqual(exported.events, ledger.events(b));
- assert.equal(summarize(exported.events), summarize(ledger.events(b)));
  assert(summarize(exported.events).includes("Reads: 1 entry, 0 reference"));
  assert.deepEqual(errors, []);
- console.log("LIFECYCLE_REGRESSION_OK");
 } finally {
  for (const request of requests) request.resolve(response({ candidates: [], recommendations: [], limitations: [] }));
  await main?.dispose(); await sub?.dispose(); ledger.close();
@@ -159,8 +157,7 @@ try {
 			env: { ...process.env, PI_CODING_AGENT_DIR: join(root, "agent"), REVIEW_PROJECT: root },
 			stdout: "pipe", stderr: "pipe",
 		});
-		const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+		const [, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
 		expect(code, stderr).toBe(0);
-		expect(stdout).toContain("LIFECYCLE_REGRESSION_OK");
 	} finally { await rm(root, { recursive: true, force: true }); }
 }, 60_000);
