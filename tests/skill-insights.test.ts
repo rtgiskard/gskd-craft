@@ -58,4 +58,32 @@ describe("insights evidence and coverage", () => {
 			expect(await identifySkillRead("skill://review/references", { ...details(join(directory, "references"), "skill://review/references"), isDirectory: true }, [])).toBeUndefined();
 		} finally { await rm(root, { recursive: true, force: true }); }
 	});
+
+	test("filesystem ownership follows the exact entry or deepest directory, not command-name length", async () => {
+		const root = await mkdtemp(join(tmpdir(), "gskd-insights-nested-"));
+		try {
+			const parent = join(root, "SKILL.md");
+			const child = join(root, "nested", "SKILL.md");
+			const reference = join(root, "nested", "references", "example.md");
+			await mkdir(join(root, "nested", "references"), { recursive: true });
+			await writeFile(parent, "# Parent");
+			await writeFile(child, "# Child");
+			await writeFile(reference, "# Reference");
+			const commands = [{ name: "skill:very-long-parent-name", path: parent }, { name: "skill:x", path: child }];
+			for (const registered of [commands, commands.toReversed()]) {
+				for (const [file, skill, source, section] of [
+					[parent, "very-long-parent-name", parent, "entry"],
+					[child, "x", child, "entry"],
+					[reference, "x", child, "reference"],
+				]) {
+					expect(await identifySkillRead(file!, { resolvedPath: file, meta: { source: { type: "path", value: file } } }, registered))
+						.toEqual({ skill, source, file, section });
+				}
+			}
+			// Internal URIs own their registered namespace, independently of the filesystem nesting.
+			expect(await identifySkillRead("skill://very-long-parent-name/nested/SKILL.md", {
+				resolvedPath: child, meta: { source: { type: "internal", value: "skill://very-long-parent-name/nested/SKILL.md" } },
+			}, commands)).toMatchObject({ skill: "very-long-parent-name", source: parent, section: "reference" });
+		} finally { await rm(root, { recursive: true, force: true }); }
+	});
 });

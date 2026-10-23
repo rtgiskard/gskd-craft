@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { statisticsSnapshot } from "./skill-stats-core";
 
 export interface ExportOptions {
@@ -112,6 +112,20 @@ async function sessionHeader(file: SourceFile): Promise<Session | undefined> {
 		}
 		return undefined;
 	} finally { await handle.close(); }
+}
+
+/** Historical names are lineage keys, never paths to open or add to the archive. */
+function historicalSessionPaths(header: Record<string, unknown>, file: SourceFile): string[] {
+	if (!Array.isArray(header.previousSessionFiles)) return [];
+	const paths = new Set<string>();
+	for (const previous of header.previousSessionFiles) {
+		// Host bucket moves retain the transcript filename. Ignore untrusted aliases
+		// outside this selected storage root or belonging to another transcript.
+		if (typeof previous !== "string" || !isAbsolute(previous) || basename(previous) !== basename(file.path)) continue;
+		const path = resolve(previous);
+		if (path !== file.root && within(file.root, path) && path.endsWith(".jsonl")) paths.add(path);
+	}
+	return [...paths];
 }
 
 async function discoverSessions(root: string, prefix: string, buckets: boolean): Promise<Session[]> {
@@ -284,6 +298,7 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 					if (header?.type !== "session") continue;
 					if (typeof header.id === "string") await descendants(header.id);
 					await descendants(file.path);
+					for (const path of historicalSessionPaths(header, file)) await descendants(path);
 					if (typeof header.seanceSource !== "string") continue;
 					const dependencyPath = resolve(header.seanceSource);
 					if (!collected.has(dependencyPath)) await enqueue(await sourceSession(dependencyPath));
@@ -328,7 +343,7 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 		await command("zstd", ["-q", "-f", tar, "-o", compressed], signal);
 		signal?.throwIfAborted();
 		await chmod(compressed, 0o600);
-		const filename = `omp-sessions_${localTime}_${batchId}.tar.zst`;
+		const filename = `omp-export_${localTime}_${batchId}.tar.zst`;
 		const archive = join(output, filename);
 		signal?.throwIfAborted();
 		await rename(compressed, archive);

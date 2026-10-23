@@ -32,7 +32,7 @@ interface ReceiptHold {
 }
 
 interface ReceiptControl {
-	id?: string;
+	event?: ToolResultEvent;
 	entered(event: ToolResultEvent): void;
 	released: Promise<void>;
 	delivered(): void;
@@ -66,7 +66,7 @@ interface LocationFixture {
 	renderLayout(width?: number): string[];
 	command(args?: string): Promise<void>;
 	bash(directory?: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }): Promise<{ id: string; result: unknown; isError: boolean }>;
-	writeBash(directory: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }, controls?: { signal?: AbortSignal; onUpdate?(update: unknown): void }): Promise<{ id: string; result: unknown; isError: boolean }>;
+	writeBash(directory: string, command?: string, options?: { async?: boolean; name?: string; timeout?: number }, controls?: { id?: string; signal?: AbortSignal; onUpdate?(update: unknown): void }): Promise<{ id: string; result: unknown; isError: boolean }>;
 	holdBashReceipt(): ReceiptHold;
 	rewriteNextBash(from: string, to: string): void;
 	cancelSessionSwitch(): void;
@@ -220,6 +220,7 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 				"retry.enabled": false, "compaction.enabled": false, "memory.backend": "off",
 				"memories.enabled": false, "telemetry.otlpExportEnabled": false,
 				"providers.openaiWebsockets": "off",
+				"bash.autoBackground.enabled": false,
 				"async.enabled": false, "launch.enabled": true,
 				"tools.xdev": options.deviceBash === true,
 			}),
@@ -240,7 +241,7 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 					if (event.toolName !== "bash" || !armedReceipt) return;
 					const hold = armedReceipt;
 					armedReceipt = undefined;
-					hold.id = event.toolCallId;
+					hold.event = event;
 					hold.entered(event);
 					await hold.released;
 				});
@@ -254,7 +255,7 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 				} }));
 				api.on("tool_result", event => {
 					if (event.toolName !== "bash") return;
-					for (const hold of receiptHolds) if (hold.id === event.toolCallId) {
+					for (const hold of receiptHolds) if (hold.event === event) {
 						receiptHolds.delete(hold);
 						hold.delivered();
 					}
@@ -333,10 +334,10 @@ async function fixture(options: { deviceBash?: boolean } = {}): Promise<Location
 			await scope.run("end", () => runner.emit({ type: "tool_execution_end", toolName: "bash", toolCallId: id, result, isError }));
 			return { id, result, isError };
 		},
-		async writeBash(directory: string, command = "printf 'REAL_XD_BASH_RECEIPT\\n'", options: { async?: boolean; name?: string; timeout?: number } = {}, controls: { signal?: AbortSignal; onUpdate?(update: unknown): void } = {}) {
+		async writeBash(directory: string, command = "printf 'REAL_XD_BASH_RECEIPT\\n'", options: { async?: boolean; name?: string; timeout?: number } = {}, controls: { id?: string; signal?: AbortSignal; onUpdate?(update: unknown): void } = {}) {
 			const tool = session.agent.state.tools.find(tool => tool.name === "write");
 			if (!tool) throw new Error("SDK did not provide the requested write transport");
-			const id = `location-xd-${++nextCall}`;
+			const id = controls.id ?? `location-xd-${++nextCall}`;
 			const args = { path: "xd://bash", content: JSON.stringify({ cwd: directory, command, ...options }) };
 			const runner = session.extensionRunner!;
 			// Only the outer write has agent-loop lifecycle events. Nested bash
@@ -488,6 +489,166 @@ describe("worktree location through the real SDK and Git worktrees (no model pro
 			released.resolve();
 			canonical.release();
 			try { await pending; } finally { server.stop(true); }
+		}
+	}, { deviceBash: true }));
+
+	for (const replacement of ["none", "newer"] as const) test(`a silent foreground xd bash receipt delayed past outer cancellation ${replacement === "none" ? "still records canonical input" : "cannot supersede a newer observation"}`, () => withFixture(async f => {
+		await f.writeBash(f.a);
+		const previous = structuredClone(snapshot(f.session));
+		const previousEntries = f.session.sessionManager.getEntries().length;
+		const canonical = f.holdBashReceipt();
+		f.rewriteNextBash(f.a, f.b);
+		const controller = new AbortController();
+		const updates: unknown[] = [];
+		const pending = f.writeBash(f.a, "true", {}, { signal: controller.signal, onUpdate: update => updates.push(update) });
+		try {
+			const event = await canonical.entered;
+			expect(event.input.cwd).toBe(f.b);
+			expect(event.isError).toBe(false);
+			expect(updates).toEqual([]);
+			controller.abort();
+			const outer = await pending;
+			expect(outer.isError).toBe(true);
+			expect(event.toolCallId).toBe(outer.id);
+			expect(snapshot(f.session)).toEqual(previous);
+			expect(f.session.sessionManager.getEntries()).toHaveLength(previousEntries);
+			let newer: Snapshot | undefined;
+			if (replacement === "newer") {
+				const current = await f.writeBash(f.other);
+				expect(current.isError).toBe(false);
+				newer = structuredClone(snapshot(f.session));
+			}
+			canonical.release();
+			await canonical.delivered;
+			if (replacement === "none") {
+				expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.b, source: "bash.cwd", toolCallId: outer.id,
+					phase: "end", git: { root: f.b, branch: "worktree-b" } });
+				expectVisibleLocation(f, f.b, "worktree-b");
+			} else {
+				expect(snapshot(f.session)).toEqual(newer);
+				expectVisibleLocation(f, f.other, "shared-name");
+			}
+		} finally {
+			controller.abort();
+			canonical.release();
+			await pending;
+			await canonical.delivered;
+		}
+	}, { deviceBash: true }));
+
+	for (const oldRewritten of [false, true]) for (const firstReceipt of ["old", "new"] as const) {
+		test(`an ${oldRewritten ? "input-replaced" : "unchanged-input"} old-session canonical receipt delivered ${firstReceipt === "old" ? "before" : "after"} a new same-ID receipt cannot publish old input or consume the new receipt`, () => withFixture(async f => {
+			await f.writeBash(f.a);
+			const originalSession = f.session.sessionManager.getSessionId();
+			const id = "reused-sdk-call-id";
+			const oldReceipt = f.holdBashReceipt();
+			const oldController = new AbortController();
+			if (oldRewritten) f.rewriteNextBash(f.a, f.b);
+			const old = f.writeBash(oldRewritten ? f.a : f.b, "true", {}, { id, signal: oldController.signal });
+			let current: Promise<{ id: string; result: unknown; isError: boolean }> | undefined;
+			let currentReceipt: ReceiptHold | undefined;
+			try {
+				const oldEvent = await oldReceipt.entered;
+				expect(oldEvent.input.cwd).toBe(f.b);
+				oldController.abort();
+				expect((await old).isError).toBe(true);
+				expect(await f.session.newSession()).toBe(true);
+				expect(f.session.sessionManager.getSessionId()).not.toBe(originalSession);
+				currentReceipt = f.holdBashReceipt();
+				current = f.writeBash(f.other, "true", {}, { id });
+				const currentEvent = await currentReceipt.entered;
+				expect(currentEvent.toolCallId).toBe(oldEvent.toolCallId);
+				expect(currentEvent.input.cwd).toBe(f.other);
+				if (firstReceipt === "old") {
+					oldReceipt.release();
+					await oldReceipt.delivered;
+					expect(snapshot(f.session)?.latest ?? null).toBeNull();
+					currentReceipt.release();
+					await currentReceipt.delivered;
+				} else {
+					currentReceipt.release();
+					await currentReceipt.delivered;
+					const confirmed = structuredClone(snapshot(f.session));
+					oldReceipt.release();
+					await oldReceipt.delivered;
+					expect(snapshot(f.session)).toEqual(confirmed);
+				}
+				expect((await current).isError).toBe(false);
+				expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.other, source: "bash.cwd", toolCallId: id,
+					phase: "end", git: { root: f.other, branch: "shared-name" } });
+				expectVisibleLocation(f, f.other, "shared-name");
+				if (oldRewritten && firstReceipt === "old") expect(f.notices.at(-1)).toMatch(/ambiguous invocation identity/);
+			} finally {
+				oldController.abort();
+				oldReceipt.release();
+				currentReceipt?.release();
+				await Promise.all([old, current]);
+			}
+		}, { deviceBash: true }));
+	}
+
+	test("fresh replacement inputs from two same-ID sessions are explicitly ambiguous rather than attributed to the current call", () => withFixture(async f => {
+		const id = "indistinguishable-replaced-call-id";
+		const oldReceipt = f.holdBashReceipt();
+		const oldController = new AbortController();
+		f.rewriteNextBash(f.a, f.b);
+		const old = f.writeBash(f.a, "true", {}, { id, signal: oldController.signal });
+		let currentReceipt: ReceiptHold | undefined;
+		let current: Promise<{ id: string; result: unknown; isError: boolean }> | undefined;
+		try {
+			const oldEvent = await oldReceipt.entered;
+			oldController.abort();
+			expect((await old).isError).toBe(true);
+			expect(await f.session.newSession()).toBe(true);
+			currentReceipt = f.holdBashReceipt();
+			f.rewriteNextBash(f.a, f.b);
+			current = f.writeBash(f.a, "true", {}, { id });
+			const currentEvent = await currentReceipt.entered;
+			expect(currentEvent.toolCallId).toBe(oldEvent.toolCallId);
+			expect(currentEvent.input).toEqual(oldEvent.input);
+			expect(currentEvent.input).not.toBe(oldEvent.input);
+			currentReceipt.release();
+			await currentReceipt.delivered;
+			expect((await current).isError).toBe(false);
+			expect(snapshot(f.session)?.latest ?? null).toBeNull();
+			expect(f.notices.at(-1)).toMatch(/ambiguous invocation identity/);
+			oldReceipt.release();
+			await oldReceipt.delivered;
+			expect(snapshot(f.session)?.latest ?? null).toBeNull();
+			expect(f.render()).toEqual([]);
+			const identifiable = await f.writeBash(f.other);
+			expect(identifiable.isError).toBe(false);
+			expect(snapshot(f.session)?.latest).toMatchObject({ directory: f.other, toolCallId: identifiable.id,
+				phase: "end", git: { root: f.other } });
+		} finally {
+			oldController.abort();
+			oldReceipt.release();
+			currentReceipt?.release();
+			await Promise.all([old, current]);
+		}
+	}, { deviceBash: true }));
+
+	test("terminal shutdown releases receipt ownership and late canonical delivery cannot remount the widget", () => withFixture(async f => {
+		await f.writeBash(f.other);
+		expectVisibleLocation(f, f.other, "shared-name");
+		const canonical = f.holdBashReceipt();
+		const controller = new AbortController();
+		const pending = f.writeBash(f.b, "true", {}, { signal: controller.signal });
+		try {
+			await canonical.entered;
+			controller.abort();
+			expect((await pending).isError).toBe(true);
+			await f.session.dispose();
+			expect(f.render()).toEqual([]);
+			const changes = f.uiChanges;
+			canonical.release();
+			await canonical.delivered;
+			expect(f.render()).toEqual([]);
+			expect(f.uiChanges).toBe(changes);
+		} finally {
+			controller.abort();
+			canonical.release();
+			await pending;
 		}
 	}, { deviceBash: true }));
 

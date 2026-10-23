@@ -18,10 +18,12 @@ export interface StatisticsSnapshot { version: 1; events: StatsEvent[] }
 
 const eventColumns = "id, kind, at, cwd, session, agent, branch, data";
 
+// Existing events tables already persist insertion order in SQLite's rowid.
+// Retain that order for timestamp ties in both live reads and exported snapshots.
 function readEvents(db: Database, cwd?: string): StatsEvent[] {
 	const rows = cwd === undefined
-		? db.query<EventRow, []>(`SELECT ${eventColumns} FROM events ORDER BY at, id`).all()
-		: db.query<EventRow, [string]>(`SELECT ${eventColumns} FROM events WHERE cwd = ? ORDER BY at, id`).all(cwd);
+		? db.query<EventRow, []>(`SELECT ${eventColumns} FROM events ORDER BY at, rowid`).all()
+		: db.query<EventRow, [string]>(`SELECT ${eventColumns} FROM events WHERE cwd = ? ORDER BY at, rowid`).all(cwd);
 	return rows.map(row => ({ ...row, data: JSON.parse(row.data) as Record<string, unknown> }));
 }
 
@@ -123,7 +125,7 @@ export function summarize(events: StatsEvent[]): string {
 	const covered = new Set<string>();
 	const statuses = { started: 0, completed: 0, failed: 0, cancelled: 0 };
 	const coverage: string[] = [];
-	const decisions = new Map<string, { at: number; id: string; state: "confirmed" | "rejected" }>();
+	const decisions = new Map<string, { at: number; state: "confirmed" | "rejected" }>();
 	const candidateIds = new Set<string>();
 	let availability = 0;
 	function group(data: Record<string, unknown>): SkillGroup | undefined {
@@ -171,8 +173,8 @@ export function summarize(events: StatsEvent[]): string {
 			if (event.data.origin === "model" && typeof event.data.candidateId === "string"
 				&& (event.data.decision === "confirm" || event.data.decision === "reject")) {
 				const previous = decisions.get(event.data.candidateId);
-				if (!previous || event.at > previous.at || (event.at === previous.at && event.id > previous.id)) {
-					decisions.set(event.data.candidateId, { at: event.at, id: event.id,
+				if (!previous || event.at >= previous.at) {
+					decisions.set(event.data.candidateId, { at: event.at,
 						state: event.data.decision === "confirm" ? "confirmed" : "rejected" });
 				}
 			} else if (event.data.origin === "explicit" || event.data.origin === "model") {

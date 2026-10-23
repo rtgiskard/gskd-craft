@@ -215,6 +215,10 @@ interface ObservedCall {
 	sequence: number;
 	confirmed: boolean;
 	receipt: boolean;
+	called: boolean;
+	started: boolean;
+	retired: boolean;
+	identityWarning?: boolean;
 	completion?: Promise<void>;
 	controller?: AbortController;
 }
@@ -237,6 +241,13 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 	let bindingController: AbortController | undefined;
 	const controllers = new Set<AbortController>();
 	const calls = new Map<string, ObservedCall>();
+	// Bash normalization preserves the exact input object. Keep weak ownership
+	// across restoration; a receipt's mutable context cannot identify its origin.
+	let inputOwners = new WeakMap<object, ObservedCall | null>();
+	// Unresolved retired IDs cannot expire safely: a replaced-input receipt can
+	// arrive arbitrarily late. Retain only counts, not calls/probes/controllers,
+	// until recognized receipts resolve them or terminal shutdown clears them.
+	const retiredCalls = new Map<string, number>();
 
 	function active(ctx: ExtensionContext): boolean {
 		return !stopped && ctx.agent.kind === "main" && sessionId === ctx.sessionManager.getSessionId();
@@ -293,7 +304,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		bindingGeneration++;
 		for (const pending of controllers) pending.abort();
 		controllers.clear();
-		calls.clear();
+		for (const [id, call] of calls) retire(id, call);
 		bindingController = undefined;
 	}
 
@@ -336,12 +347,60 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		render(ctx);
 	}
 
-	function capture(ctx: ExtensionContext, toolCallId: string): ObservedCall {
+	function retire(toolCallId: string, call: ObservedCall): void {
+		call.controller?.abort();
+		if (!call.receipt && !call.retired) {
+			call.retired = true;
+			retiredCalls.set(toolCallId, (retiredCalls.get(toolCallId) ?? 0) + 1);
+		}
+		if (calls.get(toolCallId) === call) calls.delete(toolCallId);
+	}
+
+	function rememberInput(input: unknown, call: ObservedCall): void {
+		if (!object(input)) return;
+		const owner = inputOwners.get(input);
+		inputOwners.set(input, owner === undefined || owner === call ? call : null);
+	}
+
+	function capture(ctx: ExtensionContext, toolCallId: string, input: unknown, phase: "called" | "started"): ObservedCall {
 		let call = calls.get(toolCallId);
+		if (call?.[phase]) { retire(toolCallId, call); call = undefined; }
 		if (!call) {
-			call = { epoch, sessionId: ctx.sessionManager.getSessionId(), sequence: ++sequence, confirmed: false, receipt: false };
+			call = { epoch, sessionId: ctx.sessionManager.getSessionId(), sequence: ++sequence,
+				confirmed: false, receipt: false, called: false, started: false, retired: false };
 			calls.set(toolCallId, call);
 		}
+		call[phase] = true;
+		rememberInput(input, call);
+		return call;
+	}
+
+	function receiptOwner(ctx: ExtensionContext, toolCallId: string, input: object): ObservedCall | undefined {
+		const call = calls.get(toolCallId);
+		const owner = inputOwners.get(input);
+		if (owner) {
+			if (owner === call) return call;
+			if (owner.retired) {
+				owner.retired = false;
+				owner.receipt = true;
+				const remaining = (retiredCalls.get(toolCallId) ?? 1) - 1;
+				if (remaining > 0) retiredCalls.set(toolCallId, remaining);
+				else retiredCalls.delete(toolCallId);
+			}
+			return;
+		}
+		if (!call) return;
+		if (owner === null || retiredCalls.has(toolCallId)) {
+			// A later extension may replace input after our tool_call hook. With
+			// a reused ID, the SDK exposes no immutable identity to attribute that
+			// new object. Do not publish it or consume an identifiable new receipt.
+			if (!call.identityWarning) {
+				call.identityWarning = true;
+				notify(ctx, `Worktree location not updated: bash receipt ${JSON.stringify(toolCallId)} has ambiguous invocation identity after input replacement and call-ID reuse. The SDK must supply an immutable invocation token.`, true);
+			}
+			return;
+		}
+		rememberInput(input, call);
 		return call;
 	}
 
@@ -352,8 +411,7 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		// Superseded calls no longer own publication or query resources.
 		for (const [id, previous] of calls) {
 			if (previous.sequence >= selectedSequence) continue;
-			previous.controller?.abort();
-			calls.delete(id);
+			retire(id, previous);
 		}
 		render(ctx);
 		return true;
@@ -424,30 +482,38 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", (_event, ctx) => {
 		invalidate();
 		stopped = true;
+		// SDK disposal is terminal. Do not keep unresolved identities or their
+		// weak ownership values alive after the observer can no longer publish.
+		retiredCalls.clear();
+		inputOwners = new WeakMap();
 		if (ctx.agent.kind === "main" && ctx.mode === "tui" && ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
 	});
 
 	pi.on("tool_call", (event, ctx) => {
-		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId);
+		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId, event.input, "called");
 	});
 	pi.on("tool_execution_start", (event, ctx) => {
-		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId);
+		if (active(ctx) && event.toolName === "bash") capture(ctx, event.toolCallId, event.args, "started");
 	});
 	pi.on("tool_execution_update", (event, ctx) => {
 		if (!active(ctx)) return;
 		const call = calls.get(event.toolCallId);
+		let input = event.args;
 		if (!call || call.receipt) return;
 		if (event.toolName === "write") {
 			const partial = event.partialResult;
 			const details = object(partial) && object(partial.details) ? partial.details : undefined;
 			const xdev = details?.xdev;
 			if (!object(xdev) || xdev.tool !== "bash" || xdev.mode !== "execute") return;
+			input = xdev.args;
 		} else if (event.toolName !== "bash") return;
+		const owner = object(input) ? inputOwners.get(input) : undefined;
+		if (owner !== undefined ? owner !== call : retiredCalls.has(event.toolCallId)) return;
 		confirm(ctx, call);
 	});
 	pi.on("tool_result", async (event, ctx) => {
 		if (!active(ctx) || event.toolName !== "bash") return;
-		const call = calls.get(event.toolCallId);
+		const call = receiptOwner(ctx, event.toolCallId, event.input);
 		if (!call || call.receipt) return;
 		if ((object(event.details) && event.details.executed === false) || (!call.confirmed && !invocationResult(event.isError, event.details))) {
 			calls.delete(event.toolCallId);
@@ -470,20 +536,10 @@ export default function worktreeLocation(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("tool_approval_resolved", (event, ctx) => {
-		if (!active(ctx) || event.toolName !== "bash" || event.approved) return;
+		if (!active(ctx) || event.toolName !== "bash" || event.approved || event.sessionId !== sessionId) return;
 		const call = calls.get(event.toolCallId);
 		call?.controller?.abort();
 		calls.delete(event.toolCallId);
-		render(ctx);
-	});
-	pi.on("tool_execution_end", async (event, ctx) => {
-		if (!active(ctx)) return;
-		const call = calls.get(event.toolCallId);
-		if (!call) return;
-		if (call.completion) { await call.completion; return; }
-		// Outer cancellation ends waiting, not the canonical invocation. Only
-		// its receipt can confirm effective input; retain eligible evidence.
-		if (!call.confirmed) calls.delete(event.toolCallId);
 		render(ctx);
 	});
 

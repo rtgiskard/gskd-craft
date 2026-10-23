@@ -69,13 +69,24 @@ export async function identifySkillRead(input: string, details: unknown, command
 	if (!target || !isAbsolute(target)) return undefined;
 	const internal = meta?.type === "internal" && typeof meta.value === "string" && meta.value.startsWith("skill://") ? meta.value : undefined;
 	const uri = internal ? InternalUrlRouter.instance().split(internal).path : undefined;
-	const command = commands.toSorted((a, b) => b.name.length - a.name.length).find(command => {
-		if (!command.path) return false;
-		const name = command.name.replace(/^skill:/, "");
-		if (uri) return uri === `skill://${name}` || uri.startsWith(`skill://${name}/`);
-		const part = relative(dirname(command.path), target);
-		return !isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`);
-	});
+	let command: (typeof commands)[number] | undefined;
+	let specificity = -1;
+	for (const candidate of commands) {
+		if (!candidate.path) continue;
+		if (uri) {
+			const name = candidate.name.replace(/^skill:/, "");
+			if ((uri === `skill://${name}` || uri.startsWith(`skill://${name}/`)) && name.length > specificity) {
+				command = candidate; specificity = name.length;
+			}
+		} else {
+			if (candidate.path === target) { command = candidate; break; }
+			const directory = dirname(candidate.path);
+			const part = relative(directory, target);
+			if (!isAbsolute(part) && part !== ".." && !part.startsWith(`..${sep}`) && directory.length > specificity) {
+				command = candidate; specificity = directory.length;
+			}
+		}
+	}
 	if (command?.path) return { skill: command.name.replace(/^skill:/, ""), source: command.path, file: input, section: target === command.path ? "entry" : "reference" };
 	if (!uri) return undefined;
 	const parts = uri.slice(8).split("/").filter(Boolean).map(part => decodeURIComponent(part));
@@ -99,6 +110,7 @@ export default function skillInsights(pi: ExtensionAPI): void {
 	const reads = new Map<string, { row: StatsEvent; commands: { name: string; path?: string }[]; sessionFile: string | null }>();
 	let timer: Timer | undefined;
 	let timerContext: ExtensionContext | undefined;
+	let lifecycleContext: ExtensionContext | undefined;
 	let unsubscribeInput: (() => void) | undefined;
 	let active: { controller: AbortController; session: string; leaf: string | null; generation: number } | undefined;
 	let generation = 0;
@@ -132,10 +144,12 @@ export default function skillInsights(pi: ExtensionAPI): void {
 	function available(ctx: ExtensionContext) {
 		if (ctx.agent.kind !== "main") return;
 		const skills = pi.getCommands().filter(command => command.source === "skill").map(command => ({ skill: command.name.replace(/^skill:/, ""), source: command.path ?? "unknown" }));
-		save(ctx, event(ctx, "availability", { skills, basis: "registered-skill-commands", promptVisible: "unknown", model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null }));
+		const model = ctx.models.current();
+		save(ctx, event(ctx, "availability", { skills, basis: "registered-skill-commands", promptVisible: "unknown", model: model ? `${model.provider}/${model.id}` : null }));
 	}
-	function schedule(ctx: ExtensionContext) {
-		if (ctx.agent.kind !== "main" || stopped || compactionPending) return;
+	function schedule() {
+		const ctx = lifecycleContext;
+		if (!ctx || stopped || compactionPending) return;
 		if (timer !== undefined) timerContext?.clearTimer(timer);
 		timer = undefined;
 		try {
@@ -143,7 +157,7 @@ export default function skillInsights(pi: ExtensionAPI): void {
 			timerContext = ctx;
 			timer = ctx.setTimeout(() => {
 				timer = undefined;
-				if (!idle(ctx) || active) { schedule(ctx); return; }
+				if (!idle(ctx) || active) { schedule(); return; }
 				void analyze(ctx, false).catch(error => { lastError = String(error); });
 			}, Math.max(IDLE_MS, lastAttempt + IDLE_MS - Date.now()));
 		} catch (error) { ctx.ui.notify(`Skill insights unavailable: ${String(error)}`, "warning"); }
@@ -151,8 +165,8 @@ export default function skillInsights(pi: ExtensionAPI): void {
 	async function analyze(ctx: ExtensionContext, manual: boolean) {
 		if (active || !idle(ctx)) { if (manual) ctx.ui.notify("Insights analysis requires an idle main session.", "warning"); return; }
 		if (!manual && !enabled()) return;
-		if (!ctx.model) { if (manual) ctx.ui.notify("No analysis model: select a session model first.", "warning"); return; }
-		const model = ctx.model;
+		const model = ctx.models.current();
+		if (!model) { if (manual) ctx.ui.notify("No analysis model: select a session model first.", "warning"); return; }
 		const session = ctx.sessionManager.getSessionId();
 		const leaf = ctx.sessionManager.getLeafId();
 		const cwd = ctx.cwd;
@@ -209,15 +223,17 @@ export default function skillInsights(pi: ExtensionAPI): void {
 			if (manual) ctx.ui.notify(`Insights analysis: ${lastError}`, "warning");
 		} finally {
 			if (settingWatch !== undefined) ctx.clearTimer(settingWatch);
+			const ownsRequest = active === request && generation === request.generation;
 			if (active === request) active = undefined;
-			// Only successful batches may continue automatically. Failures wait for fresh activity or explicit run.
-			if (!controller.signal.aborted && !lastError && !stopped) schedule(ctx);
+			// Only the current successful batch may continue automatically.
+			if (ownsRequest && !controller.signal.aborted && !lastError && !stopped) schedule();
 			if (stopped) { store?.close(); store = undefined; }
 		}
 	}
 	async function recommend(ctx: ExtensionContext, rows: StatsEvent[]) {
 		if (active || !idle(ctx)) { ctx.ui.notify("Usage advice requires an idle main session with no active analysis.", "warning"); return; }
-		if (!ctx.model) throw new Error("Select a session model before requesting advice");
+		const model = ctx.models.current();
+		if (!model) throw new Error("Select a session model before requesting advice");
 		const evidence = rows.filter(row => row.kind === "read" || row.kind === "feedback" || row.kind === "analysis" && row.data.status === "completed");
 		if (!evidence.length) { ctx.ui.notify("No usage or feedback evidence in the selected scope; no model request sent.", "info"); return; }
 		const selected: StatsEvent[] = [];
@@ -229,7 +245,6 @@ export default function skillInsights(pi: ExtensionAPI): void {
 		}
 		selected.reverse();
 		if (!selected.length) throw new Error("Selected records exceed advice input capacity; narrow the scope");
-		const model = ctx.model;
 		const session = ctx.sessionManager.getSessionId();
 		const leaf = ctx.sessionManager.getLeafId();
 		const controller = new AbortController();
@@ -257,36 +272,38 @@ export default function skillInsights(pi: ExtensionAPI): void {
 		} catch (error) {
 			if (!controller.signal.aborted) ctx.ui.notify(clean(`Usage advice failed: ${String(error)}`), "warning");
 		} finally {
+			const ownsRequest = active === request && generation === request.generation;
 			if (active === request) active = undefined;
-			if (!stopped) schedule(ctx);
-			else { store?.close(); store = undefined; }
+			if (ownsRequest && !stopped) schedule();
+			if (stopped) { store?.close(); store = undefined; }
 		}
 	}
 	function restore(ctx: ExtensionContext) {
 		cancel(); stopped = false; busy = false; compactionPending = false;
+		lifecycleContext = ctx;
 		reads.clear();
 		unsubscribeInput?.();
-		unsubscribeInput = ctx.mode === "tui" && ctx.hasUI ? ctx.ui.onTerminalInput(() => { cancel(); schedule(ctx); return undefined; }) : undefined;
+		unsubscribeInput = ctx.mode === "tui" && ctx.hasUI ? ctx.ui.onTerminalInput(() => { cancel(); schedule(); return undefined; }) : undefined;
 		try {
 			available(ctx);
 			if (!db().getSetting("analysis.notice")) {
-				ctx.ui.notify("Skill insights: automatic idle analysis is ON by default. Conversation snapshots may be sent to the current model and incur charges. /gskd-insights analysis off disables it; facts remain local. Results never enter the main conversation.", "warning");
+				ctx.ui.notify(`Skill insights: automatic idle analysis is ${enabled() ? "ON" : "OFF"} (profile setting; default ON). Conversation snapshots may be sent to the current model and incur charges. /gskd-insights analysis off disables it; facts remain local. Results never enter the main conversation.`, "info");
 				db().setSetting("analysis.notice", "1");
 			}
-			schedule(ctx);
+			schedule();
 		} catch (error) { ctx.ui.notify(`Skill insights unavailable: ${String(error)}`, "warning"); }
 	}
 	pi.on("session_start", (_event, ctx) => { if (ctx.agent.kind === "main") restore(ctx); });
 	for (const name of ["session_switch", "session_branch", "session_tree"] as const) pi.on(name, (_event, ctx) => { if (ctx.agent.kind === "main") restore(ctx); });
-	pi.on("input", (_event, ctx) => { if (ctx.agent.kind === "main") { cancel(); schedule(ctx); } });
-	pi.on("agent_start", (_event, ctx) => { if (ctx.agent.kind === "main") { compactionPending = false; busy = true; cancel(); } });
-	pi.on("agent_end", (_event, ctx) => { if (ctx.agent.kind === "main") { busy = false; schedule(ctx); } });
+	pi.on("input", (_event, ctx) => { if (ctx.agent.kind === "main") { cancel(); lifecycleContext = ctx; schedule(); } });
+	pi.on("agent_start", (_event, ctx) => { if (ctx.agent.kind === "main") { lifecycleContext = ctx; compactionPending = false; busy = true; cancel(); } });
+	pi.on("agent_end", (_event, ctx) => { if (ctx.agent.kind === "main") { lifecycleContext = ctx; busy = false; schedule(); } });
 	pi.on("session_before_compact", (_event, ctx) => { if (ctx.agent.kind === "main") { compactionPending = true; cancel(); } });
-	pi.on("session_compact", (_event, ctx) => { if (ctx.agent.kind === "main") { compactionPending = false; schedule(ctx); } });
-	pi.on("auto_compaction_end", (_event, ctx) => { if (ctx.agent.kind === "main") { compactionPending = false; schedule(ctx); } });
-	pi.on("session_shutdown", (_event, ctx) => {
-		if (ctx.agent.kind !== "main") return;
+	pi.on("session_compact", (_event, ctx) => { if (ctx.agent.kind === "main") { lifecycleContext = ctx; compactionPending = false; schedule(); } });
+	pi.on("auto_compaction_end", (_event, ctx) => { if (ctx.agent.kind === "main") { lifecycleContext = ctx; compactionPending = false; schedule(); } });
+	pi.on("session_shutdown", () => {
 		stopped = true; cancel(); unsubscribeInput?.(); unsubscribeInput = undefined;
+		lifecycleContext = undefined;
 		reads.clear();
 		// An in-flight request still needs the ledger to journal cancellation.
 		if (!active) { store?.close(); store = undefined; }
@@ -294,7 +311,7 @@ export default function skillInsights(pi: ExtensionAPI): void {
 	pi.on("tool_call", (call, ctx) => {
 		if (stopped || call.toolName !== "read") return;
 		const key = `${ctx.agent.kind}:${ctx.agent.id}:${call.toolCallId}`;
-		reads.set(key, { row: event(ctx, "read", {}, `read:${ctx.sessionManager.getSessionId()}:${key}`),
+		if (!reads.has(key)) reads.set(key, { row: event(ctx, "read", {}, `read:${ctx.sessionManager.getSessionId()}:${key}`),
 			commands: pi.getCommands().filter(command => command.source === "skill"), sessionFile: ctx.sessionManager.getSessionFile() ?? null });
 	});
 	pi.on("tool_result", async (result, ctx) => {
@@ -312,20 +329,22 @@ export default function skillInsights(pi: ExtensionAPI): void {
 		description: "Inspect local skill usage, feedback and idle side-channel analysis",
 		handler: async (args, ctx) => {
 			try {
-				const words = args.trim().split(/\s+/).filter(Boolean);
+				const tokens = [...args.matchAll(/\S+/g)];
+				const words = tokens.map(token => token[0]);
 				if (words[0] === "help" || words[0] === "--help") { ctx.ui.notify(help, "info"); return; }
 				if (words[0] === "analysis") {
 					const action = words[1] ?? "status";
 					if (words.length > 2) throw new Error(help);
 					if (action === "off" || action === "on") {
 						db().setSetting("analysis.enabled", String(action === "on"));
-						cancel(); if (action === "on") schedule(ctx);
+						cancel(); if (action === "on") schedule();
 					} else if (action === "run") { await analyze(ctx, true); return; }
 					else if (action !== "status") throw new Error(help);
 					const analyses = db().events(ctx.cwd).filter(row => row.session === ctx.sessionManager.getSessionId() && row.kind === "analysis");
 					const covered = new Set(analyses.filter(row => row.data.status === "completed").flatMap(row => row.data.entryIds as string[] ?? []));
 					const pending = buildInsightBatch(ctx.sessionManager.getBranch().filter(row => row.type === "message"), covered).pending;
-					ctx.ui.notify(`Idle analysis: ${enabled() ? "on" : "off"} (profile-persistent); delay ${IDLE_MS / 1000}s; ${active ? "running" : timer !== undefined ? "waiting" : "idle"}\nModel: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unavailable"}\nUnanalyzed branch fragments: ${pending}\nLatest: ${String(analyses.at(-1)?.data.status ?? "none")}\n${lastError ? `Error: ${clean(lastError)}\n` : ""}DB: ${join(getAgentDir(), "gskd-skill-insights.sqlite")}`, "info");
+					const model = ctx.models.current();
+					ctx.ui.notify(`Idle analysis: ${enabled() ? "on" : "off"} (profile-persistent); delay ${IDLE_MS / 1000}s; ${active ? "running" : timer !== undefined ? "waiting" : "idle"}\nModel: ${model ? `${model.provider}/${model.id}` : "unavailable"}\nUnanalyzed branch fragments: ${pending}\nLatest: ${String(analyses.at(-1)?.data.status ?? "none")}\n${lastError ? `Error: ${clean(lastError)}\n` : ""}DB: ${join(getAgentDir(), "gskd-skill-insights.sqlite")}`, "info");
 					return;
 				}
 				if (words[0] === "feedback") {
@@ -342,9 +361,10 @@ export default function skillInsights(pi: ExtensionAPI): void {
 						const match = words[2]?.match(/^(.+):(\d+)$/);
 						if (!match || words.length !== 3) throw new Error(help);
 						const analysis = db().events(ctx.cwd).find(row => row.id === match[1] && row.kind === "analysis" && row.data.status === "completed");
-						const candidate = (analysis?.data.candidates as Candidate[] | undefined)?.[Number(match[2])];
+						const index = Number(match[2]);
+						const candidate = (analysis?.data.candidates as Candidate[] | undefined)?.[index];
 						if (!candidate) throw new Error("Candidate not found in this project");
-						if (save(ctx, event(ctx, "feedback", { ...candidate, origin: "model", confirmed: words[1] === "confirm", decision: words[1], candidateId: words[2], evidenceSession: analysis!.session }))) ctx.ui.notify(`Candidate ${words[1]}ed.`, "info");
+						if (save(ctx, event(ctx, "feedback", { ...candidate, origin: "model", confirmed: words[1] === "confirm", decision: words[1], candidateId: `${analysis!.id}:${index}`, evidenceSession: analysis!.session }))) ctx.ui.notify(`Candidate ${words[1]}ed.`, "info");
 						return;
 					}
 					const positive = words[1] === "positive";
@@ -354,9 +374,12 @@ export default function skillInsights(pi: ExtensionAPI): void {
 					let offset = positive ? 2 : 1;
 					const explicit = words[offset] === "--skill";
 					const named = explicit ? words[offset + 1] : undefined;
+					if (explicit && !named) throw new Error(help);
 					if (explicit) offset += 2;
-					const text = words.slice(offset).join(" ");
-					if (!text || explicit && !named) throw new Error(help);
+					const prefix = tokens[offset - 1]!;
+					// Consume one command separator; all remaining feedback bytes are evidence.
+					const text = args.slice(prefix.index! + prefix[0].length + 1);
+					if (!text.trim()) throw new Error(help);
 					const suggestions = new Map(nearby.map(read => [JSON.stringify([read.skill, read.source]), read]));
 					const suggestion = suggestions.size === 1 ? [...suggestions.values()][0] : undefined;
 					const skill = named ?? (suggestion ? String(suggestion.skill) : "unknown");

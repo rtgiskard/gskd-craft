@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { isKittyProtocolActive, setKittyProtocolActive } from "@oh-my-pi/pi-tui";
 import taskRecovery from "../extensions/task-recovery";
 
 type Handler = (event: Record<string, unknown>, ctx: ExtensionContext) => unknown;
@@ -15,6 +16,8 @@ interface Harness {
 	timers: number;
 	emit(event: string, payload?: Record<string, unknown>): void;
 	stop(message?: TestMessage, signal?: AbortSignal, messages?: unknown[]): void;
+	detached(event: string, payload: Record<string, unknown>): void;
+	persist(messages: TestMessage[]): void;
 	command(args: string): void;
 	terminal(data: string): unknown;
 	advance(ms: number): void;
@@ -50,9 +53,11 @@ function harness(): Harness {
 	let jobs = false;
 	let kind = "main";
 	let aborts = 0;
+	let history: TestMessage[] = [];
 	const ctx = {
 		get agent() { return { kind }; }, mode: "tui", hasUI: true,
-		sessionManager: { getSessionId: () => sessionId, getLeafId: () => leafId },
+		sessionManager: { getSessionId: () => sessionId, getLeafId: () => leafId,
+			getBranch: () => history.map((message, index) => ({ id: `${index}:${message.role}:${message.timestamp}`, type: "message", message })) },
 		ui: { setWidget: (_key: string, content: ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined) => {
 			status.push(content ? content(undefined, { fg: (_color: string, text: string) => text }).render(80).join("\n") : "");
 		},
@@ -76,9 +81,17 @@ function harness(): Harness {
 	return {
 		get now() { return now; }, sent, notices, status,
 		get aborts() { return aborts; }, get timers() { return timers.size; },
-		emit(event: string, payload: Record<string, unknown> = {}) { for (const handler of handlers.get(event) ?? []) handler(payload, ctx); },
+		emit(event: string, payload: Record<string, unknown> = {}) {
+			// Normal delivery follows persistence; detached delivery deliberately
+			// leaves the authoritative active branch at its newer state.
+			if (Array.isArray(payload.messages) && (event === "agent_end" || event === "session_stop")) history = payload.messages as TestMessage[];
+			if (event === "message_start" && (payload.message as TestMessage)?.role === "user") history.push(payload.message as TestMessage);
+			this.detached(event, payload);
+		},
+		detached(event: string, payload: Record<string, unknown>) { for (const handler of handlers.get(event) ?? []) handler(payload, ctx); },
+		persist(messages: TestMessage[]) { history = messages; },
 		stop(message: TestMessage = assistant(), signal?: AbortSignal, messages: unknown[] = [message]) {
-			this.emit("session_stop", { messages, last_assistant_message: message, signal });
+			this.emit("session_stop", { messages, last_assistant_message: message, signal, session_id: sessionId });
 		},
 		command(args: string) { commands.get("gskd-recovery")!.handler(args, ctx); },
 		terminal(data: string) { return input?.(data); },
@@ -98,6 +111,7 @@ function harness(): Harness {
 		},
 		activity(options: Activity) {
 			idle = options.idle ?? idle; pending = options.pending ?? pending; jobs = options.jobs ?? jobs;
+			if (options.sessionId !== undefined && options.sessionId !== sessionId) history = [];
 			sessionId = options.sessionId ?? sessionId; leafId = options.leafId ?? leafId; kind = options.kind ?? kind;
 		},
 	};
@@ -204,6 +218,29 @@ for (const cancellation of ["off", "Esc", "Ctrl-C", "new input", "new turn", "se
 
 test("ordinary terminal input is observed without consuming or cancelling recovery", () => withHarness(h => {
 	h.stop(); expect(h.terminal("hello")).toBeUndefined(); h.fireNext();
+	expect(h.sent).toHaveLength(1);
+}));
+
+for (const data of ["\u001b[27u", "\u001b[27;1u", "\u001b[99;5u", "\u001b[99;5:1u", "\u001b[99;5:2u", "\u001b[27;5;99~"]) {
+	test(`host key decoding cancels recovery for ${JSON.stringify(data)}`, () => {
+		const kittyWasActive = isKittyProtocolActive();
+		setKittyProtocolActive(true);
+		try {
+			withHarness(h => {
+				h.stop();
+				expect(h.terminal(data)).toBeUndefined();
+				h.advance(600_000);
+				expect(h.sent).toHaveLength(0);
+				expect(h.timers).toBe(0);
+			});
+		} finally { setKittyProtocolActive(kittyWasActive); }
+	});
+}
+
+test("pasted text containing a Ctrl-C byte is not a Ctrl-C keypress", () => withHarness(h => {
+	h.stop();
+	expect(h.terminal("\u001b[200~pasted\u0003text\u001b[201~")).toBeUndefined();
+	h.fireNext();
 	expect(h.sent).toHaveLength(1);
 }));
 
@@ -469,5 +506,115 @@ test("off clears a subsequent cooldown without aborting an idle host", () => wit
 	expect(h.aborts).toBe(0);
 	expect(h.timers).toBe(0);
 	h.advance(600_000);
+	expect(h.sent).toHaveLength(1);
+}));
+
+for (const phase of ["cooldown", "running"] as const) for (const oldOutcome of ["stop", "error", "aborted", "willContinue", "awaitingAsyncWork"] as const) {
+	test(`detached old ${oldOutcome} cannot change a newer ${phase} recovery episode`, () => withHarness(h => {
+		const oldMessage = assistant(1, oldOutcome === "stop" ? "stop" : oldOutcome === "aborted" ? "aborted" : "error");
+		h.stop(oldMessage);
+		h.emit("input", { text: "replacement task" });
+		const currentFailure = assistant(2);
+		h.stop(currentFailure);
+		if (phase === "running") {
+			h.fireNext();
+			h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+		}
+		const rendered = [...h.status];
+		h.detached("agent_end", { messages: [oldMessage], willContinue: oldOutcome === "willContinue", awaitingAsyncWork: oldOutcome === "awaitingAsyncWork" });
+		expect(h.timers).toBe(phase === "cooldown" ? 1 : 0);
+		expect(h.status).toEqual(rendered);
+		if (phase === "cooldown") {
+			h.command("status");
+			expect(h.notices.at(-1)).toContain("attempt=1");
+			h.fireNext();
+			h.emit("message_start", { message: { role: "custom", ...h.sent[0].message } });
+		}
+		expect(h.sent).toHaveLength(1);
+		expect(recoveryTotals(h).completed).toBe(0);
+		const success = assistant(3, "stop");
+		h.stop(success);
+		h.emit("agent_end", { messages: [success] });
+		expect(recoveryTotals(h).completed).toBe(1);
+	}));
+}
+
+test("detached old agent_end cannot establish recovery in an empty new session", () => withHarness(h => {
+	const oldFailure = assistant(1);
+	// The older snapshot was detached before this extension observed it;
+	// invalidation's last-failure deduplication alone cannot reject it.
+	h.stop(assistant(2));
+	h.emit("session_before_switch");
+	h.activity({ sessionId: "new-session" });
+	h.emit("session_switch");
+	h.detached("agent_end", { messages: [oldFailure] });
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(0);
+	expect(h.timers).toBe(0);
+}));
+
+test("persisted replacement user message rejects an older detached settle", () => withHarness(h => {
+	const failure = assistant(1);
+	h.stop(failure);
+	h.emit("message_start", { message: { role: "user", timestamp: 2, content: [] } });
+	h.detached("agent_end", { messages: [failure] });
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(0);
+}));
+
+test("foreign session_stop cannot cancel or replace the current failure", () => withHarness(h => {
+	const controller = new AbortController();
+	h.stop(assistant(2), controller.signal);
+	const aborted = new AbortController();
+	aborted.abort();
+	h.detached("session_stop", { session_id: "previous-session", messages: [assistant(1)], signal: aborted.signal });
+	expect(h.timers).toBe(1);
+	h.fireNext();
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("suspected transport failures receive only two probes while confirmed failures remain unlimited", () => withHarness(h => {
+	for (let turn = 1; turn <= 3; turn++) {
+		const failure = { ...assistant(turn), errorMessage: "upstream failure" };
+		h.stop(failure);
+		h.emit("agent_end", { messages: [failure] });
+		if (turn <= 2) {
+			expect(h.timers).toBe(1);
+			h.fireNext();
+			h.emit("message_start", { message: { role: "custom", ...h.sent.at(-1)!.message } });
+		} else {
+			expect(h.timers).toBe(0);
+			h.advance(600_000);
+		}
+	}
+	expect(h.sent).toHaveLength(2);
+	expect(h.notices.some(notice => notice.includes("two unconfirmed"))).toBe(true);
+}));
+
+test("terminal tool-call errors skipped by session_stop still recover with explicit receipts", () => withHarness(h => {
+	const failure = { ...assistant(1), content: [{ type: "toolCall", id: "not-run", name: "effect", arguments: {} }] };
+	const receipt = { role: "toolResult", toolCallId: "not-run", content: [{ type: "text", text: "interrupted before execution" }],
+		isError: true, __synthetic: true, details: { executed: false } };
+	h.emit("agent_end", { messages: [failure, receipt] });
+	h.fireNext();
+	expect(h.sent).toHaveLength(1);
+}));
+
+test("a fork inheriting an unobserved old failure cannot acquire its detached recovery", () => withHarness(h => {
+	const inheritedFailure = assistant(1);
+	h.stop(assistant(2));
+	h.emit("session_before_switch");
+	h.activity({ sessionId: "fork-session" });
+	h.persist([inheritedFailure]);
+	h.emit("session_switch");
+	h.detached("agent_end", { messages: [inheritedFailure] });
+	h.advance(600_000);
+	expect(h.sent).toHaveLength(0);
+	expect(h.timers).toBe(0);
+	// The fork's own later failure remains recoverable.
+	const ownFailure = assistant(3);
+	h.stop(ownFailure);
+	h.emit("agent_end", { messages: [inheritedFailure, ownFailure] });
+	h.fireNext();
 	expect(h.sent).toHaveLength(1);
 }));

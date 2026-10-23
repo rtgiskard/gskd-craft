@@ -31,7 +31,7 @@ export function classifyFailure(message: AssistantMessage): RecoveryFailure | un
 	];
 	// Core owns account/quota classification, including quota-worded transient
 	// throttles. Do not reinterpret its verdict using a second text classifier.
-	if (hardFlags.some(flag => AIError.is(id, flag)) || HARD_FAILURE.test(text)) return undefined;
+	if (hardFlags.some(flag => AIError.is(id, flag)) || AIError.LLAMA_CPP_TOOL_CALL_PARSE_PATTERN.test(text) || HARD_FAILURE.test(text)) return undefined;
 	if (status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429) return undefined;
 	const retryHint = extractProviderRetryHint(message.provider, text);
 	const retryAfterMs = retryHint !== undefined && Number.isFinite(retryHint) && retryHint >= 0 ? retryHint : undefined;

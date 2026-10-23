@@ -37,6 +37,7 @@ describe("recovery policy consumer behavior", () => {
 		["You exceeded your current quota, please check your plan and billing details.", 429],
 		["billing credit balance exhausted", 429], ["certificate verify failed", undefined],
 		["failed to parse tool call arguments", undefined],
+		["HTTP 500: [json.exception.parse_error.101] parse error: unexpected end of input", 500],
 	] as const) test(`does not turn hard failures into model traffic: ${text}`, () => {
 		expect(classifyFailure(failure(text, status))).toBeUndefined();
 	});
@@ -62,6 +63,14 @@ describe("recovery policy consumer behavior", () => {
 
 	test("thought-only output is not a communication failure even when the SDK calls it retriable", () => {
 		expect(classifyFailure(failure("thought-only response without final output"))).toBeUndefined();
+	});
+
+	test("host classification text cannot disguise deterministic local JSON failure as HTTP 500", () => {
+		const message = { ...failure("temporary service failure", 500),
+			errorClassificationMessage: "[json.exception.parse_error.101] parse error at line 1" };
+		const before = structuredClone(message);
+		expect(classifyFailure(message)).toBeUndefined();
+		expect(message).toEqual(before);
 	});
 
 	test("suspected transport failures remain distinguishable from confirmed transport failures", () => {

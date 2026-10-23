@@ -90,10 +90,59 @@ describe("durable skill statistics", () => {
 			event("nested", { cwd: "/project/subdirectory" }), event("other", { cwd: "/project-other" }),
 			event("empty", { cwd: "" })];
 		for (const item of records) store.record(item);
-		expect(store.events("/project").map(item => item.id)).toEqual(["a", "b", "z"]);
+		expect(store.events("/project").map(item => item.id)).toEqual(["b", "a", "z"]);
 		expect(store.events("").map(item => item.id)).toEqual(["empty"]);
 		expect(store.events("/missing")).toEqual([]);
 		expect(store.events()).toHaveLength(6);
+	});
+
+	test("resolves tied decisions by committed order across writers, reopen, legacy databases and snapshots", async () => {
+		const f = await fixture();
+		await mkdir(join(f.root, "agent"));
+		const analysis = event("analysis", { kind: "analysis", data: {
+			status: "completed", entryIds: ["entry#0", "entry#1"], candidates: [candidate,
+				{ ...candidate, text: "Second candidate" }, { ...candidate, text: "Undecided candidate" }],
+		} });
+		const decision = (id: string, index: number, value: "confirm" | "reject", at = 2000) => event(id, {
+			kind: "feedback", at, data: { origin: "model", candidateId: `analysis:${index}`, decision: value },
+		});
+		const first = decision("z-first-confirm", 0, "confirm");
+		// Reproduce the pre-fix schema and data without relying on a migration.
+		const legacy = new Database(f.path);
+		try {
+			legacy.exec(`CREATE TABLE events (id TEXT PRIMARY KEY NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL,
+				cwd TEXT NOT NULL, session TEXT NOT NULL, agent TEXT NOT NULL, branch TEXT, data TEXT NOT NULL)`);
+			for (const item of [analysis, first]) legacy.query("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+				.run(item.id, item.kind, item.at, item.cwd, item.session, item.agent, item.branch, JSON.stringify(item.data));
+		} finally { legacy.close(); }
+		const writerA = new StatsStore(f.path);
+		const writerB = new StatsStore(f.path);
+		const rejected = decision("a-last-reject", 0, "reject");
+		const rejectSecond = decision("zz-first-reject", 1, "reject");
+		const confirmed = decision("aa-last-confirm", 1, "confirm");
+		const stale = decision("stale", 1, "reject", 1500);
+		try {
+			writerB.record(rejected);
+			writerB.record(rejectSecond);
+			writerA.record(confirmed);
+			writerA.record({ ...first, data: { ...first.data, decision: "confirm", unexpected: true } });
+			writerB.record(stale);
+		} finally { writerA.close(); writerB.close(); }
+		const reopened = f.open();
+		const expected = [analysis, stale, first, rejected, rejectSecond, confirmed];
+		expect(reopened.events("/project")).toEqual(expected);
+		const snapshot = JSON.parse(JSON.stringify(statisticsSnapshot(f.path, "/project")));
+		expect(snapshot).toEqual({ version: 1, events: expected });
+		for (const records of [reopened.events(), snapshot.events]) {
+			const summary = summarize(records);
+			expect(summary).toContain("Events: 6; unique sessions: 1");
+			expect(summary).toContain("Explicit feedback: 0; model candidates: 3");
+			expect(summary).toContain("Candidate decisions: 1 confirmed, 1 rejected, 1 unconfirmed");
+			expect(summary).toContain("Candidate (rejected): Possibly missed a requirement");
+			expect(summary).toContain("Candidate (confirmed): Second candidate");
+			expect(summary).toContain("Candidate (unconfirmed): Undecided candidate");
+			expect(summary).toContain("Analysis coverage: 2 conversation fragments covered by completed runs");
+		}
 	});
 
 	test("persists settings independently from events and shares updates across connections", async () => {

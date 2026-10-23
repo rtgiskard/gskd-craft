@@ -1,6 +1,6 @@
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { truncateToWidth } from "@oh-my-pi/pi-tui";
+import { matchesKey, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { classifyFailure, recoveryDelay, type RecoveryFailure } from "./recovery-policy";
 
 const STATUS_KEY = "gskd-recovery";
@@ -64,6 +64,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	let diagnostic = "idle";
 	let unsubscribeInput: (() => void) | undefined;
 	let terminalFailureKey: string | undefined;
+	let inheritedAssistantEntryId: string | undefined;
 	let statisticsSessionId: string | undefined;
 	let statistics = { completed: 0, elapsedMs: 0, lastCompletedAt: 0, pending: 0, pendingElapsedMs: 0 };
 
@@ -129,6 +130,24 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 	function current(ctx: ExtensionContext, plan: Recovery): boolean {
 		return recovery === plan && plan.generation === generation && active(ctx) &&
 			ctx.sessionManager.getSessionId() === plan.sessionId;
+	}
+
+	function ownsAssistant(ctx: ExtensionContext, message: AssistantMessage | undefined): boolean {
+		if (!message) return false;
+		// agent_end is detached and has no session/run identity. Its snapshot
+		// may arrive after another turn or session; only the persisted active
+		// branch can authorize it to change this extension's current episode.
+		const branch = ctx.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "message") continue;
+			const currentMessage = entry.message;
+			if (currentMessage.role === "user" || currentMessage.role === "developer") return false;
+			if (currentMessage.role === "assistant") {
+				return entry.id !== inheritedAssistantEntryId && currentMessage.stopReason === message.stopReason && failureKey(currentMessage) === failureKey(message);
+			}
+		}
+		return false;
 	}
 
 	function arm(ctx: ExtensionContext, episode: Recovery, plan: Schedule, delay: number): void {
@@ -235,6 +254,9 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 
 	function bind(ctx: ExtensionContext): void {
 		const sessionId = ctx.sessionManager.getSessionId();
+		// A fork/resume can inherit the exact assistant from an old detached
+		// notification. Only assistants persisted after this binding own work here.
+		inheritedAssistantEntryId = ctx.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "assistant")?.id;
 		if (statisticsSessionId !== sessionId) {
 			statisticsSessionId = sessionId;
 			statistics = { completed: 0, elapsedMs: 0, lastCompletedAt: 0, pending: 0, pendingElapsedMs: 0 };
@@ -243,7 +265,7 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		unsubscribeInput = undefined;
 		if (ctx.agent.kind === "main" && ctx.mode === "tui") {
 			unsubscribeInput = ctx.ui.onTerminalInput(data => {
-				if (data === "\u001b" || data.includes("\u0003") || data.includes("\u001b[27;5;99~") || data.includes("\u001b[99;5u")) {
+				if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
 					invalidate(ctx, "cancelled by terminal input");
 				}
 				// Observe only: never consume or rewrite normal terminal input.
@@ -282,17 +304,20 @@ export default function taskRecovery(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("session_stop", (event, ctx) => {
+		if (event.session_id !== ctx.sessionManager.getSessionId()) return;
 		const message = event.last_assistant_message;
 		if (recovery) recovery.settleSignal = event.signal;
 		consider(ctx, message?.role === "assistant" ? message : lastAssistant(event.messages), event.messages, event.signal);
 	});
 	pi.on("agent_end", (event, ctx) => {
+		const message = lastAssistant(event.messages);
+		if (!ownsAssistant(ctx, message)) return;
 		if (event.willContinue || event.awaitingAsyncWork) {
 			pause(ctx, "host recovery/background work owns continuation");
 			return;
 		}
 		// session_stop is deliberately skipped by core for terminal tool-call turns.
-		consider(ctx, lastAssistant(event.messages), event.messages, undefined, true);
+		consider(ctx, message, event.messages, undefined, true);
 	});
 	pi.on("auto_retry_start", (_event, ctx) => pause(ctx, "host retry in progress"));
 	pi.on("auto_compaction_start", (_event, ctx) => pause(ctx, "host compaction in progress"));

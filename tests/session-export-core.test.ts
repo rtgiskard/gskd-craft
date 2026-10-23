@@ -5,7 +5,7 @@ import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, write
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { exportSessions, type ExportOptions, type ExportResult } from "../extensions/session-export-core";
-import { StatsStore, type StatsEvent } from "../extensions/skill-stats-core";
+import { StatsStore, summarize, type StatsEvent } from "../extensions/skill-stats-core";
 
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -60,6 +60,15 @@ async function unpack(result: ExportResult, root: string) {
 }
 
 describe("session export snapshot behavior", () => {
+	for (const [mode, flags] of [
+		["sessions", {}], ["with statistics", { stats: true }], ["statistics only", { statsOnly: true }],
+	] as const) test(`uses the export filename format for ${mode}`, async () => {
+		const f = await fixture();
+		await f.session("a/main.jsonl");
+		const result = await exportSessions({ ...f.options, ...flags });
+		expect(result.archive?.split("/").at(-1)).toMatch(/^omp-export_\d{8}-\d{6}_[a-f0-9]{8}\.tar\.zst$/);
+	});
+
 	test("selects project headers, nested children and artifacts, and only referenced blobs", async () => {
 		const f = await fixture();
 		const main = await f.session("encoded-project/main.jsonl");
@@ -122,6 +131,65 @@ describe("session export snapshot behavior", () => {
 		const archive = await unpack(await exportSessions(f.options), f.root);
 		expect(archive.included).toContain("sessions/b/child.jsonl");
 		expect(archive.included).toContain("sessions/c/source.jsonl");
+	});
+
+	test("captures descendants through prior bucket locations without reopening historical paths", async () => {
+		const f = await fixture();
+		const sessions = join(f.options.sourceDir, "sessions");
+		const oldest = join(sessions, "oldest/main.jsonl");
+		const previous = join(sessions, "previous/main.jsonl");
+		await f.session("current/main.jsonl", f.options.cwd, {
+			id: "parent-id", previousSessionFiles: [oldest, previous, oldest],
+		});
+		const other = join(f.root, "worktree");
+		await f.session("oldest/child.jsonl", other, { parentSession: oldest });
+		const oldChild = join(sessions, "previous/child.jsonl");
+		const child = await f.session("current/child.jsonl", other, {
+			parentSession: previous, previousSessionFiles: [oldChild],
+		});
+		await f.session("previous/grandchild.jsonl", other, { parentSession: oldChild });
+		await f.put(child.slice(0, -6) + "/result.txt", "descendant artifact");
+		await f.session("unrelated/main.jsonl", other);
+		const archive = await unpack(await exportSessions(f.options), f.root);
+		expect(archive.included.sort()).toEqual([
+			"sessions/current/child.jsonl", "sessions/current/child/result.txt", "sessions/current/main.jsonl",
+			"sessions/oldest/child.jsonl", "sessions/previous/grandchild.jsonl",
+		]);
+		expect(await readFile(join(archive.directory, "sessions/current/child/result.txt"), "utf8")).toBe("descendant artifact");
+	});
+
+	test("ignores invalid historical aliases and never follows header paths outside selected storage", async () => {
+		const f = await fixture();
+		const sessions = join(f.options.sourceDir, "sessions");
+		const outside = join(f.root, "outside/main.jsonl");
+		const traversal = join(sessions, "..", "..", "escape", "main.jsonl");
+		const wrongName = join(sessions, "old/not-main.jsonl");
+		const relativePath = "relative/main.jsonl";
+		await f.put(outside, "not a session, must never be opened\n");
+		await f.session("current/main.jsonl", f.options.cwd, {
+			previousSessionFiles: [outside, traversal, wrongName, relativePath, null, 7, {}],
+		});
+		for (const [index, parentSession] of [outside, traversal, wrongName, relativePath].entries()) {
+			await f.session(`other/child-${index}.jsonl`, join(f.root, "other"), { parentSession });
+		}
+		const archive = await unpack(await exportSessions(f.options), f.root);
+		expect(archive.included).toEqual(["sessions/current/main.jsonl"]);
+		expect(await readFile(outside, "utf8")).toBe("not a session, must never be opened\n");
+	});
+
+	test("resolves historical aliases within an explicitly selected custom session root", async () => {
+		const f = await fixture();
+		const sessionDir = join(f.root, "custom-sessions");
+		const oldParent = join(sessionDir, "old/main.jsonl");
+		await f.put(join(sessionDir, "main.jsonl"), JSON.stringify({
+			type: "session", id: "custom-parent", cwd: f.options.cwd, previousSessionFiles: [oldParent],
+		}) + "\n");
+		await f.put(join(sessionDir, "child.jsonl"), JSON.stringify({
+			type: "session", id: "custom-child", cwd: join(f.root, "other"), parentSession: oldParent,
+		}) + "\n");
+		const archive = await unpack(await exportSessions({ ...f.options, sessionDir }), f.root);
+		const prefix = `sessions-custom/${createHash("sha256").update(sessionDir).digest("hex").slice(0, 12)}`;
+		expect(archive.included.sort()).toEqual([`${prefix}/child.jsonl`, `${prefix}/main.jsonl`]);
 	});
 
 	test("nested sources and late descendants expand mixed links to a deduplicated closure", async () => {
@@ -258,6 +326,34 @@ describe("session export snapshot behavior", () => {
 		expect(archive.manifest.files.find(file => file.path === "statistics.json")).toEqual({
 			path: "statistics.json", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
 		});
+	});
+
+	test("statistics archives retain committed tie order and reconcile candidate counts after reopen", async () => {
+		const f = await fixture();
+		const path = join(f.options.sourceDir, "gskd-skill-insights.sqlite");
+		const analysis: StatsEvent = { id: "analysis", kind: "analysis", at: 1, cwd: f.options.cwd,
+			session: "session", agent: "Main", branch: null, data: { status: "completed", entryIds: ["message#0"],
+				candidates: [{ skill: "gskd-orient", source: "/skills/gskd-orient/SKILL.md", text: "Needs confirmation" }] } };
+		const first: StatsEvent = { ...analysis, id: "z-first", kind: "feedback", at: 2,
+			data: { origin: "model", candidateId: "analysis:0", decision: "confirm" } };
+		const last: StatsEvent = { ...first, id: "a-last", data: { ...first.data, decision: "reject" } };
+		const writerA = new StatsStore(path);
+		const writerB = new StatsStore(path);
+		try {
+			writerA.record(analysis);
+			writerA.record(first);
+			writerB.record(last);
+			writerB.record(first);
+		} finally { writerA.close(); writerB.close(); }
+		const archive = await unpack(await exportSessions({ ...f.options, statsOnly: true }), f.root);
+		const statistics = JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8"));
+		expect(statistics.events).toEqual([analysis, first, last]);
+		const summary = summarize(statistics.events);
+		expect(summary).toContain("Events: 3; unique sessions: 1");
+		expect(summary).toContain("Explicit feedback: 0; model candidates: 1");
+		expect(summary).toContain("Candidate decisions: 0 confirmed, 1 rejected, 0 unconfirmed");
+		expect(summary).toContain("Candidate (rejected): Needs confirmation");
+		expect(summary).toContain("Analysis coverage: 1 conversation fragments covered by completed runs");
 	});
 
 	test("stats-only ignores session storage and custom session paths", async () => {
