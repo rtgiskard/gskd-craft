@@ -3,14 +3,13 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { statisticsSnapshot } from "./skill-stats-core";
+import { statisticsSnapshot, type StatisticsSnapshot } from "./skill-stats-core";
 
 export interface ExportOptions {
 	sourceDir: string;
 	cwd: string;
 	outputDir: string;
 	all?: boolean;
-	stats?: boolean;
 	statsOnly?: boolean;
 	/** Explicit host --session-dir, including directories outside the agent root. */
 	sessionDir?: string;
@@ -21,6 +20,7 @@ export interface ExportResult {
 	archive?: string;
 	files: number;
 	message: string;
+	warnings: string[];
 }
 
 interface SourceFile { path: string; root: string; member: string; transcript?: boolean }
@@ -212,10 +212,9 @@ async function command(binary: string, args: string[], signal?: AbortSignal): Pr
 	await promise;
 }
 
-/** Local snapshots of persisted sessions and optionally skill statistics. */
+/** Local snapshots of persisted sessions and skill statistics. */
 export async function exportSessions(options: ExportOptions): Promise<ExportResult> {
 	const { signal } = options;
-	const includeStats = options.stats || options.statsOnly;
 	signal?.throwIfAborted();
 	const source = await realpath(options.sourceDir);
 	const cwd = await canonical(options.cwd);
@@ -235,7 +234,6 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 			candidates.push(...await discoverSessions(custom, prefix, false));
 		}
 		const selected = candidates.filter(session => options.all || session.cwd === cwd);
-		if (!selected.length && !includeStats) return { files: 0, message: "No sessions match the requested scope." };
 		// Resolve descendants by either persisted parent ID or transcript path.
 		const children = new Map<string, Session[]>();
 		for (const session of candidates) {
@@ -308,10 +306,11 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 		}
 		for (const file of files) await stage(file);
 		for (const hash of [...blobs].sort()) await stage({ path: join(source, "blobs", hash), root: source, member: `blobs/${hash}` });
-		if (includeStats) {
+		const warnings: string[] = [];
+		let statistics: StatisticsSnapshot | undefined;
+		try {
 			const database = join(source, "gskd-skill-insights.sqlite");
-			// SQLite may read live sidecars. They must obey the same no-link source
-			// boundary as the database; never copy the database or WAL as payloads.
+			// SQLite sidecars obey the same no-link boundary as the database.
 			for (const path of [database, `${database}-wal`, `${database}-shm`]) {
 				try {
 					await assertContained(source, path);
@@ -320,9 +319,16 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 			}
 			signal?.throwIfAborted();
 			// Statistics use the host's recorded cwd identity, which may be a symlink.
-			const statistics = statisticsSnapshot(database, options.all ? undefined : options.cwd);
-			await stageBytes("statistics.json", Buffer.from(JSON.stringify(statistics, null, 2) + "\n"));
+			statistics = statisticsSnapshot(database, options.all ? undefined : options.cwd);
+		} catch (error) {
+			signal?.throwIfAborted();
+			warnings.push(`Statistics omitted: ${error instanceof Error ? error.message : String(error)}`);
 		}
+		signal?.throwIfAborted();
+		if (!inventory.length && !statistics?.events.length) {
+			return { files: 0, warnings, message: "No session files or statistics available to export." };
+		}
+		if (statistics) await stageBytes("statistics.json", Buffer.from(JSON.stringify(statistics, null, 2) + "\n"));
 		const count = inventory.length;
 		const created = new Date();
 		const createdAt = created.toISOString();
@@ -332,8 +338,9 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 		await writeFile(join(payload, "manifest.json"), JSON.stringify({
 			version: 1, batchId, createdAt,
 			sourceDir: source, sessionDir: external, scope: options.all ? "all" : "project", cwd,
+			warnings,
 			snapshot: (options.statsOnly ? "" : "Session logs contain complete newline-terminated persisted events; ordinary artifacts retain their original bytes. In-flight unpersisted messages are not included.")
-				+ (includeStats ? `${options.statsOnly ? "" : " "}Statistics contain persisted events from a logical database snapshot; no analysis was triggered.` : ""),
+				+ (statistics ? `${options.statsOnly ? "" : " "}Statistics contain persisted events from a logical database snapshot; no analysis was triggered.` : ""),
 			files: inventory,
 		}, null, 2) + "\n", { mode: 0o600 });
 		// Separate processes give missing tar and missing zstd distinct dependency errors.
@@ -347,7 +354,7 @@ export async function exportSessions(options: ExportOptions): Promise<ExportResu
 		const archive = join(output, filename);
 		signal?.throwIfAborted();
 		await rename(compressed, archive);
-		return { archive, files: count, message: `Exported ${count} files to ${archive}` };
+		return { archive, files: count, warnings, message: `Exported ${count} files to ${archive}` };
 	} finally {
 		if (staging) await rm(staging, { recursive: true, force: true });
 	}

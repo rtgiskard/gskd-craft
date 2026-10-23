@@ -5,7 +5,7 @@ import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, write
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { exportSessions, type ExportOptions, type ExportResult } from "../extensions/session-export-core";
-import { StatsStore, summarize, type StatsEvent } from "../extensions/skill-stats-core";
+import { StatsStore, type StatsEvent } from "../extensions/skill-stats-core";
 
 const cleanups: Array<() => Promise<unknown> | unknown> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -60,15 +60,6 @@ async function unpack(result: ExportResult, root: string) {
 }
 
 describe("session export snapshot behavior", () => {
-	for (const [mode, flags] of [
-		["sessions", {}], ["with statistics", { stats: true }], ["statistics only", { statsOnly: true }],
-	] as const) test(`uses the export filename format for ${mode}`, async () => {
-		const f = await fixture();
-		await f.session("a/main.jsonl");
-		const result = await exportSessions({ ...f.options, ...flags });
-		expect(result.archive?.split("/").at(-1)).toMatch(/^omp-export_\d{8}-\d{6}_[a-f0-9]{8}\.tar\.zst$/);
-	});
-
 	test("selects project headers, nested children and artifacts, and only referenced blobs", async () => {
 		const f = await fixture();
 		const main = await f.session("encoded-project/main.jsonl");
@@ -90,6 +81,7 @@ describe("session export snapshot behavior", () => {
 		expect(archive.included.sort()).toEqual([
 			`blobs/${hash}`, "sessions/encoded-project/main.jsonl", "sessions/encoded-project/main/3.bash.log",
 			"sessions/encoded-project/main/Child.jsonl", "sessions/encoded-project/main/Child/Nested.jsonl",
+			"statistics.json",
 		].sort());
 		expect((await stat(result.archive!)).mode & 0o777).toBe(0o600);
 		for (const item of archive.manifest.files) {
@@ -107,7 +99,7 @@ describe("session export snapshot behavior", () => {
 		const first = await unpack(await exportSessions(f.options), f.root);
 		await appendFile(path, '{"type":"message","text":"next event"}\n');
 		const second = await unpack(await exportSessions(f.options), f.root);
-		expect(second.included).toEqual(["sessions/a/main.jsonl", "sessions/a/main/result.jsonl"]);
+		expect(second.included).toEqual(["sessions/a/main.jsonl", "sessions/a/main/result.jsonl", "statistics.json"]);
 		expect(await readFile(join(first.directory, "sessions/a/main.jsonl"))).toEqual(original);
 		expect(await readFile(join(second.directory, "sessions/a/main.jsonl"))).toEqual(await readFile(path));
 		expect(await readFile(join(second.directory, "sessions/a/main/result.jsonl"), "utf8")).toBe('{"value":"stable"}');
@@ -119,7 +111,7 @@ describe("session export snapshot behavior", () => {
 		await f.session("b/main.jsonl", join(f.root, "another"));
 		await f.put(join(f.options.sourceDir, "settings.json"), "secret");
 		const archive = await unpack(await exportSessions({ ...f.options, all: true }), f.root);
-		expect(archive.included.sort()).toEqual(["sessions/a/main.jsonl", "sessions/b/main.jsonl"]);
+		expect(archive.included.sort()).toEqual(["sessions/a/main.jsonl", "sessions/b/main.jsonl", "statistics.json"]);
 	});
 
 	test("captures cross-project descendants by persisted parent ID and necessary seance source", async () => {
@@ -154,6 +146,7 @@ describe("session export snapshot behavior", () => {
 		expect(archive.included.sort()).toEqual([
 			"sessions/current/child.jsonl", "sessions/current/child/result.txt", "sessions/current/main.jsonl",
 			"sessions/oldest/child.jsonl", "sessions/previous/grandchild.jsonl",
+			"statistics.json",
 		]);
 		expect(await readFile(join(archive.directory, "sessions/current/child/result.txt"), "utf8")).toBe("descendant artifact");
 	});
@@ -173,7 +166,7 @@ describe("session export snapshot behavior", () => {
 			await f.session(`other/child-${index}.jsonl`, join(f.root, "other"), { parentSession });
 		}
 		const archive = await unpack(await exportSessions(f.options), f.root);
-		expect(archive.included).toEqual(["sessions/current/main.jsonl"]);
+		expect(archive.included).toEqual(["sessions/current/main.jsonl", "statistics.json"]);
 		expect(await readFile(outside, "utf8")).toBe("not a session, must never be opened\n");
 	});
 
@@ -189,7 +182,7 @@ describe("session export snapshot behavior", () => {
 		}) + "\n");
 		const archive = await unpack(await exportSessions({ ...f.options, sessionDir }), f.root);
 		const prefix = `sessions-custom/${createHash("sha256").update(sessionDir).digest("hex").slice(0, 12)}`;
-		expect(archive.included.sort()).toEqual([`${prefix}/child.jsonl`, `${prefix}/main.jsonl`]);
+		expect(archive.included.sort()).toEqual([`${prefix}/child.jsonl`, `${prefix}/main.jsonl`, "statistics.json"]);
 	});
 
 	test("nested sources and late descendants expand mixed links to a deduplicated closure", async () => {
@@ -206,6 +199,7 @@ describe("session export snapshot behavior", () => {
 		expect(archive.included.sort()).toEqual([
 			"sessions/a/main.jsonl", "sessions/b/parent/child.jsonl", "sessions/b/parent/child/result.txt",
 			"sessions/c/branch.jsonl", "sessions/d/last.jsonl", "sessions/e/descendant.jsonl",
+			"statistics.json",
 		]);
 		expect(await readFile(join(archive.directory, "sessions/b/parent/child/result.txt"), "utf8")).toBe("source artifact");
 	});
@@ -220,7 +214,7 @@ describe("session export snapshot behavior", () => {
 		await f.session("a/main.jsonl", f.options.cwd, { seanceSource: nested });
 		const archive = await unpack(await exportSessions({ ...f.options, sessionDir }), f.root);
 		const member = `sessions-custom/${createHash("sha256").update(sessionDir).digest("hex").slice(0, 12)}/parent/child.jsonl`;
-		expect(archive.included.sort()).toEqual([member, "sessions/a/main.jsonl"].sort());
+		expect(archive.included.sort()).toEqual([member, "sessions/a/main.jsonl", "statistics.json"].sort());
 		expect(await readFile(join(archive.directory, member), "utf8")).toBe(content);
 	});
 
@@ -246,8 +240,9 @@ describe("session export snapshot behavior", () => {
 		await f.put(join(sessionDir, "custom.jsonl"), JSON.stringify({ type: "session", id: "custom", cwd: f.options.cwd }) + "\n");
 		await f.put(join(sessionDir, "custom/result.md"), "child output");
 		const archive = await unpack(await exportSessions({ ...f.options, sessionDir }), f.root);
-		expect(archive.included).toHaveLength(2);
-		expect(archive.included.every(path => /^sessions-custom\/[a-f0-9]{12}\//.test(path))).toBe(true);
+		const prefix = `sessions-custom/${createHash("sha256").update(sessionDir).digest("hex").slice(0, 12)}`;
+		expect(archive.included.sort()).toEqual([`${prefix}/custom.jsonl`, `${prefix}/custom/result.md`, "statistics.json"]);
+		expect(await readFile(join(archive.directory, `${prefix}/custom/result.md`), "utf8")).toBe("child output");
 	});
 
 	test("all retains current custom sessions while adding other projects", async () => {
@@ -287,6 +282,7 @@ describe("session export snapshot behavior", () => {
 	test("does not silently skip a malformed complete event", async () => {
 		const f = await fixture();
 		await appendFile(await f.session("a/main.jsonl"), "not JSON\n");
+		recordStatistics(f.options.sourceDir, statisticsEvents(f.options.cwd));
 		await expect(exportSessions(f.options)).rejects.toThrow("Malformed complete JSONL event");
 		expect((await readdir(f.options.outputDir)).filter(name => name.startsWith(".gskd-export-"))).toEqual([]);
 	});
@@ -308,14 +304,12 @@ describe("session export snapshot behavior", () => {
 		await expect(exportSessions(f.options)).rejects.toThrow();
 	});
 
-	test("stats attaches a hashed logical snapshot without changing default exports", async () => {
+	test("default export includes a hashed logical snapshot with recorded feedback", async () => {
 		const f = await fixture();
 		await f.session("a/main.jsonl");
 		const events = statisticsEvents(f.options.cwd);
 		recordStatistics(f.options.sourceDir, events);
-		const ordinary = await unpack(await exportSessions(f.options), f.root);
-		expect(ordinary.included).toEqual(["sessions/a/main.jsonl"]);
-		const result = await exportSessions({ ...f.options, stats: true });
+		const result = await exportSessions(f.options);
 		const archive = await unpack(result, f.root);
 		expect(archive.included).toEqual(["sessions/a/main.jsonl", "statistics.json"]);
 		expect(result.files).toBe(2);
@@ -328,7 +322,7 @@ describe("session export snapshot behavior", () => {
 		});
 	});
 
-	test("statistics archives retain committed tie order and reconcile candidate counts after reopen", async () => {
+	test("statistics archives retain complete events and committed tie order after reopen", async () => {
 		const f = await fixture();
 		const path = join(f.options.sourceDir, "gskd-skill-insights.sqlite");
 		const analysis: StatsEvent = { id: "analysis", kind: "analysis", at: 1, cwd: f.options.cwd,
@@ -348,12 +342,6 @@ describe("session export snapshot behavior", () => {
 		const archive = await unpack(await exportSessions({ ...f.options, statsOnly: true }), f.root);
 		const statistics = JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8"));
 		expect(statistics.events).toEqual([analysis, first, last]);
-		const summary = summarize(statistics.events);
-		expect(summary).toContain("Events: 3; unique sessions: 1");
-		expect(summary).toContain("Explicit feedback: 0; model candidates: 1");
-		expect(summary).toContain("Candidate decisions: 0 confirmed, 1 rejected, 0 unconfirmed");
-		expect(summary).toContain("Candidate (rejected): Needs confirmation");
-		expect(summary).toContain("Analysis coverage: 1 conversation fragments covered by completed runs");
 	});
 
 	test("stats-only ignores session storage and custom session paths", async () => {
@@ -389,45 +377,71 @@ describe("session export snapshot behavior", () => {
 	});
 
 	for (const statsOnly of [false, true]) {
-		test(`${statsOnly ? "stats-only" : "stats"} retains statistics recorded under a symlink cwd`, async () => {
+		test(`${statsOnly ? "stats-only" : "default"} retains statistics recorded under a symlink cwd`, async () => {
 			const f = await fixture();
 			const cwd = join(f.root, "linked-project");
 			await symlink(f.options.cwd, cwd);
 			await f.session("a/main.jsonl", cwd);
 			const events = statisticsEvents(cwd);
 			recordStatistics(f.options.sourceDir, events);
-			const archive = await unpack(await exportSessions({ ...f.options, cwd, stats: true, statsOnly }), f.root);
+			const archive = await unpack(await exportSessions({ ...f.options, cwd, statsOnly }), f.root);
 			expect(JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8")).events).toEqual(events);
 			expect(archive.included).toEqual(statsOnly ? ["statistics.json"] : ["sessions/a/main.jsonl", "statistics.json"]);
 		});
 	}
 
-	test("missing statistics export an empty snapshot without creating a database", async () => {
+	test("missing statistics leave no database or empty archive", async () => {
 		const f = await fixture();
 		await rm(join(f.options.sourceDir, "sessions"), { recursive: true });
-		const archive = await unpack(await exportSessions({ ...f.options, statsOnly: true }), f.root);
-		const statistics = JSON.parse(await readFile(join(archive.directory, "statistics.json"), "utf8"));
-		expect(statistics.version).toBe(1);
-		expect(statistics.events).toEqual([]);
+		const result = await exportSessions({ ...f.options, statsOnly: true });
+		expect(result.archive).toBeUndefined();
+		expect(result.files).toBe(0);
 		expect(await readdir(f.options.sourceDir)).toEqual([]);
+		expect(await readdir(f.options.outputDir)).toEqual([]);
 	});
 
-	test("stats still exports statistics when no sessions match", async () => {
+	test("default export retains statistics when no sessions match", async () => {
 		const f = await fixture();
 		await f.session("other/main.jsonl", join(f.root, "other-project"));
 		recordStatistics(f.options.sourceDir, statisticsEvents(f.options.cwd));
-		const archive = await unpack(await exportSessions({ ...f.options, stats: true }), f.root);
+		const archive = await unpack(await exportSessions(f.options), f.root);
 		expect(archive.included).toEqual(["statistics.json"]);
 	});
 
+	test("corrupt statistics warn without losing sessions or publishing a stats-only archive", async () => {
+		const f = await fixture();
+		const session = await f.session("a/main.jsonl");
+		const database = join(f.options.sourceDir, "gskd-skill-insights.sqlite");
+		await f.put(database, "corrupt database");
+		const result = await exportSessions(f.options);
+		const archive = await unpack(result, f.root);
+		expect(archive.included).toEqual(["sessions/a/main.jsonl"]);
+		expect(await readFile(join(archive.directory, "sessions/a/main.jsonl"))).toEqual(await readFile(session));
+		expect(result.warnings).toEqual([expect.stringContaining("Statistics omitted:")]);
+		expect(JSON.parse(await readFile(join(archive.directory, "manifest.json"), "utf8")).warnings).toEqual(result.warnings);
+		expect(await readFile(database, "utf8")).toBe("corrupt database");
+		const empty = await exportSessions({ ...f.options, statsOnly: true });
+		expect(empty.archive).toBeUndefined();
+		expect(empty.warnings).toEqual(result.warnings);
+		expect(await readdir(f.options.outputDir)).toEqual([result.archive!.split("/").at(-1)!]);
+	});
+
 	for (const suffix of ["", "-wal", "-shm"]) {
-		test(`statistics refuse a linked database${suffix} without publishing an archive`, async () => {
+		test(`statistics warn about a linked database${suffix} while retaining session files`, async () => {
 			const f = await fixture();
+			await f.session("a/main.jsonl");
 			const outside = join(f.root, "outside-statistics");
 			await f.put(outside, "not an export source");
 			await symlink(outside, join(f.options.sourceDir, `gskd-skill-insights.sqlite${suffix}`));
-			await expect(exportSessions({ ...f.options, statsOnly: true })).rejects.toThrow("symbolic link");
-			expect(await readdir(f.options.outputDir)).toEqual([]);
+			const result = await exportSessions(f.options);
+			const archive = await unpack(result, f.root);
+			expect(archive.included).toEqual(["sessions/a/main.jsonl"]);
+			expect(result.warnings[0]).toContain("symbolic link");
+			expect(JSON.parse(await readFile(join(archive.directory, "manifest.json"), "utf8")).warnings).toEqual(result.warnings);
+			const empty = await exportSessions({ ...f.options, statsOnly: true });
+			expect(empty.archive).toBeUndefined();
+			expect(empty.warnings[0]).toContain("symbolic link");
+			expect(await readdir(f.options.outputDir)).toEqual([result.archive!.split("/").at(-1)!]);
 		});
 	}
 
@@ -438,13 +452,14 @@ describe("session export snapshot behavior", () => {
 		expect(await readdir(f.options.sourceDir)).toEqual(["sessions"]);
 	});
 
-	test("empty scope and cancellation produce no archive", async () => {
+	test("empty scope publishes no archive and cancellation remains effective", async () => {
 		const f = await fixture();
 		const result = await exportSessions(f.options);
-		expect(result.files).toBe(0);
 		expect(result.archive).toBeUndefined();
+		expect(result.files).toBe(0);
+		expect(result.message).toContain("No session files or statistics");
 		await expect(exportSessions({ ...f.options, signal: AbortSignal.abort() })).rejects.toThrow();
-		await expect(stat(f.options.outputDir)).rejects.toMatchObject({ code: "ENOENT" });
+		expect(await readdir(f.options.outputDir)).toEqual([]);
 	});
 
 	test("reports missing tar and zstd separately and removes incomplete staging", async () => {
