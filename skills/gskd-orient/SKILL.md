@@ -66,6 +66,7 @@ description: 处理任务执行中的补充、提问、纠正、临时工作项�
 | --- | --- |
 | [design-review](../gskd-design-review/SKILL.md#触发与边界) | 实质取舍或责任／生命周期／接入疑点，包括实施或收尾中新证据引出的疑点；具体进入判断由该 Skill 持有，只检查受影响边界。 |
 | [gui-verification](../gskd-gui-verification/SKILL.md#何时使用) | 明确要求或验收依赖真实界面／输入／平台行为；提供实际证据，不自动重做设计。 |
+| [docs](../gskd-docs/SKILL.md#触发与边界) | 文档撰写、实质更新或结构调整；确定读者、用途与深度，组织逻辑并核实内容，不因写作自动重做技术设计。 |
 | [delivery-review](../gskd-delivery-review/SKILL.md#触发与边界) | 实现收尾、交付整理或提交；核对既定要求与证据，不重启有效验收。 |
 | [recap](../gskd-recap/SKILL.md#触发与参数) | 需要找回历史分析、决定、归属或停点；只读追溯，不从历史获得实施授权。 |
 
