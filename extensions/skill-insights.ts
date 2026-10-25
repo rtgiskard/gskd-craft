@@ -12,7 +12,7 @@ const MAX_BATCH_BYTES = 96_000;
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const clean = (text: string) => text.replace(/[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, " ");
-const help = "/gskd-insights [--all] [skill] [--since YYYY-MM-DD]\n/gskd-insights advice [--all] [skill] [--since YYYY-MM-DD]\n/gskd-insights analysis on|off|status|run\n/gskd-insights feedback [--skill NAME] <text>\n/gskd-insights feedback list [skill]\n/gskd-insights feedback confirm|reject <analysis-id>:<index>\n/gskd-insights feedback positive [--skill NAME] <text>";
+const help = "/gskd-insights [--all] [skill] [--since YYYY-MM-DD]\n/gskd-insights advice [--all] [skill] [--since YYYY-MM-DD]\n/gskd-insights analysis on|off|status|run\n/gskd-insights feedback [+|-] [--skill NAME] <text>\n/gskd-insights feedback list [skill]\n/gskd-insights feedback confirm|reject <analysis-id>:<index>";
 
 interface Candidate {
 	skill: string;
@@ -367,11 +367,11 @@ export default function skillInsights(pi: ExtensionAPI): void {
 						if (save(ctx, event(ctx, "feedback", { ...candidate, origin: "model", confirmed: words[1] === "confirm", decision: words[1], candidateId: `${analysis!.id}:${index}`, evidenceSession: analysis!.session }))) ctx.ui.notify(`Candidate ${words[1]}ed.`, "info");
 						return;
 					}
-					const positive = words[1] === "positive";
+					const polarity = words[1] === "+" ? "positive" : words[1] === "-" ? "problem" : "unknown";
 					const branchIds = new Set(ctx.sessionManager.getBranch().map(entry => entry.id));
 					const nearby = db().events(ctx.cwd).filter(row => row.session === ctx.sessionManager.getSessionId() && row.kind === "read" && (row.branch === null || branchIds.has(row.branch)))
 						.slice(-5).map(row => ({ id: row.id, skill: row.data.skill, source: row.data.source, version: row.data.version }));
-					let offset = positive ? 2 : 1;
+					let offset = polarity === "unknown" ? 1 : 2;
 					const explicit = words[offset] === "--skill";
 					const named = explicit ? words[offset + 1] : undefined;
 					if (explicit && !named) throw new Error(help);
@@ -384,7 +384,7 @@ export default function skillInsights(pi: ExtensionAPI): void {
 					const suggestion = suggestions.size === 1 ? [...suggestions.values()][0] : undefined;
 					const skill = named ?? (suggestion ? String(suggestion.skill) : "unknown");
 					const source = suggestion?.skill === skill && typeof suggestion.source === "string" ? suggestion.source : undefined;
-					if (save(ctx, event(ctx, "feedback", { skill, ...(source ? { source, sourceBasis: "nearby-read" } : {}), text, origin: "explicit", confirmed: true, attribution: explicit ? "user" : "suggested", polarity: positive ? "positive" : "problem", category: "unknown", nearby, sessionFile: ctx.sessionManager.getSessionFile() ?? null }))) ctx.ui.notify("Feedback saved locally.", "info");
+					if (save(ctx, event(ctx, "feedback", { skill, ...(source ? { source, sourceBasis: "nearby-read" } : {}), text, origin: "explicit", confirmed: true, attribution: explicit ? "user" : "suggested", polarity, category: "unknown", nearby, sessionFile: ctx.sessionManager.getSessionFile() ?? null }))) ctx.ui.notify("Feedback saved locally.", "info");
 					return;
 				}
 				const recommendations = words[0] === "advice";

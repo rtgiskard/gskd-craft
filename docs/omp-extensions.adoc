@@ -105,13 +105,13 @@ SDK 未暴露“新输入已接纳、仍在图片预处理”的状态，扩展�
 [source,text]
 ----
 /gskd-insights feedback 这里应该先讨论方案
-/gskd-insights feedback --skill gskd-orient 这里应该先讨论方案
-/gskd-insights feedback positive --skill gskd-orient 本次明确区分了调查与实施授权
+/gskd-insights feedback - --skill gskd-orient 这里应该先讨论方案
+/gskd-insights feedback + --skill gskd-orient 本次明确区分了调查与实施授权
 /gskd-insights feedback list
 ----
 
 反馈原文保留，自动绑定项目和会话位置。当前分支附近只有一个 skill／来源组合时预填关联，否则记为 `unknown`；预填不代表用户确认归因。
-`--skill` 可明确指定对象，包括尚未读取的 skill。同名但不同来源不会自动合并；默认分类未确定，正面反馈用 `feedback positive`。
+`--skill` 可明确指定对象，包括尚未读取的 skill。同名但不同来源不会自动合并；反馈倾向默认 `unknown`（未判定），用 `feedback +` 明确正面、`feedback -` 明确问题，不自动推断原文倾向。分类仍未确定，已有历史记录不重写。
 `feedback list` 后可加 skill 名称筛选。
 
 模型候选的分类、章节归属和重复问题标签都待判断。用反馈列表中的候选 ID 替换下面的 `<analysis-id>:<index>`，确认或拒绝：

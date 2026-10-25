@@ -59,9 +59,12 @@ try {
  assert(notices.at(-1).includes("0 confirmed, 0 rejected, 1 unconfirmed"), notices.at(-1));
  assert(notices.at(-1).includes("model candidates: 1"), notices.at(-1));
  for (const [prefix, raw, skill, polarity] of [
-  ["feedback", "first line\\n\\t  indented  second line  ", "unknown", "problem"],
-  ["feedback --skill review", "  preserve   spacing\\n\\tcode();  ", "review", "problem"],
-  ["feedback positive --skill review", "\\n  exact  positive\\ttext  ", "review", "positive"],
+  ["feedback", "first line\\n\\t  indented  second line  ", "unknown", "unknown"],
+  ["feedback --skill review", "  preserve   spacing\\n\\tcode();  ", "review", "unknown"],
+  ["feedback + --skill review", "\\n  exact  positive\\ttext  ", "review", "positive"],
+  ["feedback -", "  needs correction\\n  details  ", "unknown", "problem"],
+  ["feedback +", "helpful", "unknown", "positive"],
+  ["feedback - --skill review", "wrong target", "review", "problem"],
  ]) {
   const before = new Set(store.events(root).map(row => row.id));
   await session.prompt("/gskd-insights " + prefix + " " + raw);
