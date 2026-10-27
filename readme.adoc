@@ -32,6 +32,7 @@ omp plugin link .
 |link:skills/gskd-design-review/SKILL.md[gskd-design-review] |判断设计取舍、责任边界、生命周期与实际接入
 |link:skills/gskd-gui-verification/SKILL.md[gskd-gui-verification] |验证真实界面、输入交互及平台行为
 |link:skills/gskd-docs/SKILL.md[gskd-docs] |以整体逻辑、关键机制和必要信息帮助理解、操作与自行适配
+|link:skills/gskd-communication/SKILL.md[gskd-communication] |整理消息、反馈、建议和请求，保留原意、现实困难与承诺边界，适配对象和语境
 |link:skills/gskd-delivery-review/SKILL.md[gskd-delivery-review] |对照已接受要求，核对实现、证据和交付边界
 |link:skills/gskd-recap/SKILL.md[gskd-recap] |梳理分析、决定、进展与续接位置，不自动执行历史任务
 |===
