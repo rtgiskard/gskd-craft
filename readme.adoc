@@ -1,6 +1,6 @@
 = gskd craft
 
-工程协作技能与 oh-my-pi（`omp`）配套扩展。技能提供工作方法，扩展提供宿主内的运行辅助；两者按需使用，不组成固定流水线。
+面向 agent 的工程协作技能与 oh-my-pi（`omp`）配套扩展。`skills/` 提供可供不同 agent 接入的工作方法，`extensions/` 提供 omp 内的运行辅助；两者按需使用，不组成固定流水线。
 
 [[setup]]
 == 接入与更新
@@ -17,13 +17,17 @@ omp plugin link .
 链接直接指向源码，无需复制文件，不搬迁现有配置或会话数据。使用命名 profile 时改为 `omp --profile work plugin link .`。
 首次接入或更新仓库后，启动新会话，omp 会发现技能并加载扩展。
 
-=== 其它宿主
+扩展默认跟随 omp 最新版本。
 
-按宿主约定接入 `skills/` 下的技能目录，保留 `SKILL.md`、`references/` 和相对引用。`extensions/` 仅用于 omp。
+NOTE: `skill-insights` 的自动空闲分析默认开启，会将对话片段发送给当前模型，可能产生费用。不需要时，在 omp 输入框执行 `/gskd-insights analysis off`；开关按 profile 保存，仍会在本地记录 skill 的读取情况。详见 link:docs/omp-extensions.adoc#insights[Skill 使用洞察]。
+
+=== 其他 agent
+
+按所用 agent 的技能加载方式接入 `skills/` 下的技能目录，保留 `SKILL.md`、`references/` 和相对引用。`extensions/` 仅用于 omp。
 
 == 技能
 
-按当前任务选择，具体标准见各技能入口：
+按任务需要直接选择，不必先经过某个统一入口；触发条件、判断标准与边界见各技能：
 
 [cols="1,3",options="header"]
 |===
@@ -31,13 +35,13 @@ omp plugin link .
 |link:skills/gskd-orient/SKILL.md[gskd-orient] |处理补充、纠正、工作项插入、并行安排与暂停续接
 |link:skills/gskd-design-review/SKILL.md[gskd-design-review] |判断设计取舍、责任边界、生命周期与实际接入
 |link:skills/gskd-gui-verification/SKILL.md[gskd-gui-verification] |验证真实界面、输入交互及平台行为
-|link:skills/gskd-docs/SKILL.md[gskd-docs] |以整体逻辑、关键机制和必要信息帮助理解、操作与自行适配
-|link:skills/gskd-communication/SKILL.md[gskd-communication] |整理消息、反馈、建议和请求，保留原意、现实困难与承诺边界，适配对象和语境
+|link:skills/gskd-docs/SKILL.md[gskd-docs] |撰写、更新与组织工程文档，帮助读者理解、操作与适配
+|link:skills/gskd-communication/SKILL.md[gskd-communication] |代拟、整理或润色发给他人的消息，保留原意与承诺边界
 |link:skills/gskd-delivery-review/SKILL.md[gskd-delivery-review] |对照已接受要求，核对实现、证据和交付边界
 |link:skills/gskd-recap/SKILL.md[gskd-recap] |梳理分析、决定、进展与续接位置，不自动执行历史任务
 |===
 
-能力取决于宿主工具、权限和环境。已读且仍适用的内容可以复用；发现、读取或注入技能不等于落实要求，应以实际行动和证据判断。
+技能能否落实，取决于 agent 提供的工具、权限与运行环境。已读且仍适用的内容可以复用；发现、读取或注入技能不等于落实要求，应以实际行动和证据判断。
 
 == omp 扩展
 
@@ -47,15 +51,20 @@ omp plugin link .
 |===
 |扩展 |用途
 |link:docs/omp-extensions.adoc#recovery[task-recovery] |暂时性上游通信故障后的自动续接，默认开启
-|link:docs/omp-extensions.adoc#worktree[worktree-location] |显示最近 bash 执行所在的工作树，可显式绑定任务工作树
+|link:docs/omp-extensions.adoc#worktree[worktree-location] |显示最近 bash 声明的执行位置，可显式绑定任务工作树；不切换目录或分支
 |link:docs/omp-extensions.adoc#display[display-preset] |按需启用轻量 TUI 显示预设，不持久修改设置
-|link:docs/omp-extensions.adoc#insights[skill-insights] |积累读取事实、反馈和分析候选；自动空闲分析默认开启，建议由用户显式请求
-|link:docs/omp-extensions.adoc#export[session-export] |导出本地会话与洞察统计快照，需要 `tar` 和 `zstd`
+|link:docs/omp-extensions.adoc#insights[skill-insights] |分别保存 skill 读取记录、用户反馈与模型分析出的待确认反馈；使用建议由用户显式请求，不自动修改技能
+|link:docs/omp-extensions.adoc#export[session-export] |导出本地会话与洞察统计快照，不发送网络请求；需要 `tar` 和 `zstd`
 |===
 
-== 待议方向
+== 开发与验证
 
-以下仅为探索方向，尚未实现或安排实施：
+在仓库根使用 Bun 安装锁定依赖并运行现有行为测试：
 
-* `gskd-inspect`：考虑合并故障定位与性能调查，以可证伪假设、真实负载和可区分原因的实验建立证据；设计取舍仍由设计技能承担，调查不构成修复或优化授权。
-* 模型独立判断与客观性：针对用户观察到的 `6.1-sol` 缺少主见、顺着用户说、不够客观的问题，探索性格设定及用户／模型切换机制，但不预设它就是解法。原因与适用范围待验证；目标是依据证据形成判断、指出前提问题并合理修正，而非刻意反对。
+[source,shell]
+----
+bun install --frozen-lockfile
+bun run test
+----
+
+导出相关测试同样需要 `tar` 和 `zstd`。测试覆盖核心逻辑、SDK 接入及本地模拟服务下的故障续接，不依赖付费模型服务；通过测试不代表真实 TUI 交互或模型执行技能的效果已经验证。
